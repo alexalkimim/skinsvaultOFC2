@@ -47,8 +47,6 @@ async function extractSteamID(input, apiKey) {
 
 // ---------------------------------------------------------
 // PARSER — inclui TODOS os itens marketáveis (mesmo não tradáveis)
-// Itens recém saídos de trade lock têm tradable=0 temporariamente
-// mas marketable=1 e TÊM preço, então devem ser incluídos
 // ---------------------------------------------------------
 function parseInventoryResponse(data) {
   const descMap = {};
@@ -68,8 +66,9 @@ function parseInventoryResponse(data) {
       continue;
     }
 
-    // Inclui se for marketável OU tradável
-    // (itens recém saídos de trade lock: marketable=1, tradable=0 por até 3 dias)
+    // CORREÇÃO: Itens recém saídos de trade lock podem ter tradable=0 na Steam pública,
+    // mas marketable=1. Se usarmos o Trade Link, eles aparecem normalmente.
+    // Mantemos a lógica de incluir se for marketável OU tradável.
     if (!desc.marketable && !desc.tradable) {
       ignorados++;
       continue;
@@ -94,7 +93,6 @@ function parseInventoryResponse(data) {
 
 // ---------------------------------------------------------
 // PAGINAÇÃO DA STEAM PÚBLICA
-// Inventários grandes retornam more_items=1 — precisamos buscar todas as páginas
 // ---------------------------------------------------------
 async function fetchSteamPublicInventory(steamId) {
   logger.request(`Steam pública: buscando todas as páginas do inventário...`);
@@ -112,29 +110,30 @@ async function fetchSteamPublicInventory(steamId) {
     };
     if (lastAssetId) params.start_assetid = lastAssetId;
 
-    const { data } = await axios.get(
-      `https://steamcommunity.com/inventory/${steamId}/730/2`,
-      { timeout: 20000, params }
-    );
+    try {
+      const { data } = await axios.get(
+        `https://steamcommunity.com/inventory/${steamId}/730/2`,
+        { timeout: 20000, params }
+      );
 
-    if (!data?.assets) break;
+      if (!data?.assets) break;
 
-    allAssets       = allAssets.concat(data.assets);
-    allDescriptions = allDescriptions.concat(data.descriptions || []);
+      allAssets       = allAssets.concat(data.assets);
+      allDescriptions = allDescriptions.concat(data.descriptions || []);
 
-    logger.info(`  Página ${page}: +${data.assets.length} itens (total: ${allAssets.length})`);
+      logger.info(`  Página ${page}: +${data.assets.length} itens (total: ${allAssets.length})`);
 
-    // Se não tem mais páginas, para
-    if (!data.more_items || data.more_items === 0) break;
+      if (!data.more_items || data.more_items === 0) break;
 
-    lastAssetId = data.last_assetid;
-    page++;
+      lastAssetId = data.last_assetid;
+      page++;
 
-    // Segurança: máximo 20 páginas (40.000 itens)
-    if (page > 20) { logger.warn('Limite de 20 páginas atingido.'); break; }
-
-    // Delay pequeno entre páginas para não sobrecarregar a Steam
-    await new Promise(r => setTimeout(r, 500));
+      if (page > 20) { logger.warn('Limite de 20 páginas atingido.'); break; }
+      await new Promise(r => setTimeout(r, 500));
+    } catch (err) {
+      logger.error(`Erro na página ${page}: ${err.message}`);
+      break;
+    }
   }
 
   return { assets: allAssets, descriptions: allDescriptions };
@@ -146,13 +145,14 @@ async function fetchSteamPublicInventory(steamId) {
 async function fetchInventory(steamId, apiKey) {
   const cacheKey = `inventory:${steamId}`;
   const cached   = cache.get(cacheKey);
-  if (cached) { logger.cache(`Inventário ${steamId} (cache local)`); return cached; }
+  if (cached) { logger.cache(`Inventário ${steamId} (cache em memória)`); return cached; }
 
   const tradelink = tradeLinkMemory.get(steamId);
   let data;
 
   // TENTATIVA 1: API v2 via Trade Link (Business/Enterprise)
-  // Mostra itens recém saídos de trade lock que a Steam ainda não mostra publicamente
+  // Esta é a ÚNICA forma de pegar itens que acabaram de sair do trade lock
+  // e ainda não estão visíveis no inventário público da Steam.
   if (tradelink) {
     logger.request(`Tentativa 1: Inventário via Trade Link (API v2)...`);
     try {
@@ -160,16 +160,17 @@ async function fetchInventory(steamId, apiKey) {
         timeout: 20000,
         params: { api_key: apiKey, tradelink: encodeURIComponent(tradelink), appid: 730 },
       });
+      // Verificamos se retornou assets. A API v2 é superior para itens em trade lock.
       if (res.data?.assets?.length > 0) {
         data = res.data;
         logger.success(`✅ Inventário via Trade Link: ${data.assets.length} assets`);
       }
     } catch (err) {
-      logger.warn(`API v2 indisponível (${err.response?.status || err.message}). Tentando v1...`);
+      logger.warn(`API v2 (Trade Link) falhou ou não autorizada. Tentando v1...`);
     }
   }
 
-  // TENTATIVA 2: API v1 via SteamID (com cache-bust)
+  // TENTATIVA 2: API v1 via SteamID
   if (!data) {
     logger.request(`Tentativa 2: Inventário via SteamID (API v1)...`);
     try {
@@ -177,17 +178,16 @@ async function fetchInventory(steamId, apiKey) {
         timeout: 20000,
         params: { api_key: apiKey, steamid64: steamId, appid: 730, contextid: 2 },
       });
-      if (res.data?.success === 1 && res.data?.assets?.length > 0) {
+      if (res.data?.assets?.length > 0) {
         data = res.data;
         logger.success(`✅ Inventário v1: ${data.assets.length} assets`);
       }
     } catch (err) {
-      logger.warn(`API v1 falhou (${err.response?.status || err.message}). Tentando Steam pública...`);
+      logger.warn(`API v1 falhou. Tentando Steam pública...`);
     }
   }
 
   // TENTATIVA 3: Steam pública com paginação completa
-  // Esta é a mais completa — busca TODAS as páginas
   if (!data) {
     logger.request(`Tentativa 3: Steam pública (com paginação completa)...`);
     data = await fetchSteamPublicInventory(steamId);
@@ -200,7 +200,7 @@ async function fetchInventory(steamId, apiKey) {
   const items = parseInventoryResponse(data);
   logger.success(`${items.length} itens parseados`);
 
-  // Cache local de 1 minuto — inventário muda rápido
+  // Cache em memória curto (1 min) para evitar spam, mas permitir atualizações rápidas
   cache.set(cacheKey, items, 1 * 60 * 1000);
   return items;
 }

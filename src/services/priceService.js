@@ -1,21 +1,14 @@
 // priceService.js — PRECISO (CNY Nativo -> BRL Ao Vivo)
-//
-// MUDANÇAS CRÍTICAS vs versão anterior:
-//   1. Removido filtro "Anti-Troll" — causava preços artificiais
-//   2. Salva TODOS os itens no banco, incluindo preço 0 (graffitis, stickers)
-//      → Sem isso, itens com preço 0 re-buscavam API em cada execução
-//   3. Câmbio via CNY→BRL direto (Buff/YouPin são plataformas em CNY)
-//   4. Fallback USD→BRL se CNY falhar
-
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
 const db     = require('./dbService');
 
-// Taxa CNY→BRL (e fallback USD→BRL)
+// Taxas de câmbio
 let CNY_TO_BRL = 0.78;  // fallback
 let USD_TO_BRL = 5.70;  // fallback
-let useDirectCNY = false; // se conseguimos a taxa CNY direta
+let CNY_TO_USD = 0.138; // fallback (aprox 7.24 CNY/USD)
+let useDirectCNY = false;
 
 async function fetchExchangeRate() {
   // Taxa manual no .env tem prioridade absoluta
@@ -26,62 +19,56 @@ async function fetchExchangeRate() {
   }
 
   try {
-    // Busca USD-BRL E CNY-BRL ao mesmo tempo (1 chamada, 2 pares)
+    // Busca USD-BRL, CNY-BRL e USD-CNY para máxima precisão
     const { data } = await axios.get(
-      'https://economia.awesomeapi.com.br/last/USD-BRL,CNY-BRL',
+      'https://economia.awesomeapi.com.br/last/USD-BRL,CNY-BRL,USD-CNY',
       { timeout: 8000 }
     );
 
-    if (data?.USDBRL?.bid) {
-      USD_TO_BRL = Number(data.USDBRL.bid);
+    if (data?.USDBRL?.bid) USD_TO_BRL = Number(data.USDBRL.bid);
+    if (data?.CNYBRL?.bid) {
+      CNY_TO_BRL = Number(data.CNYBRL.bid);
+      useDirectCNY = true;
+    }
+    if (data?.USDCNY?.bid) {
+      // A API retorna USD-CNY (ex: 7.24). Precisamos de CNY-USD para reverter o USD da CSInventoryAPI
+      const usdCny = Number(data.USDCNY.bid);
+      CNY_TO_USD = 1 / usdCny;
     }
 
-    if (data?.CNYBRL?.bid) {
-      CNY_TO_BRL   = Number(data.CNYBRL.bid);
-      useDirectCNY = true;
-      logger.success(
-        `Câmbio ao vivo →  1 USD = R$ ${USD_TO_BRL.toFixed(4)}  |  1 CNY = R$ ${CNY_TO_BRL.toFixed(4)}`
-      );
-    } else {
-      logger.success(`Câmbio ao vivo →  1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
-    }
+    logger.success(
+      `Câmbio ao vivo → 1 CNY = R$ ${CNY_TO_BRL.toFixed(4)} | 1 USD = R$ ${USD_TO_BRL.toFixed(4)} | 1 USD = ${ (1/CNY_TO_USD).toFixed(4) } CNY`
+    );
   } catch {
-    logger.warn(`Câmbio não atualizado. USD=${USD_TO_BRL.toFixed(4)} CNY=${CNY_TO_BRL.toFixed(4)}`);
+    logger.warn(`Câmbio não atualizado. Usando fallbacks.`);
   }
 }
 
-// Converte USD (como retornado pela API) para BRL
-// A API já converteu CNY→USD internamente usando a taxa deles.
-// Para compensar a taxa interna da API (geralmente 7.2 CNY/USD),
-// reconvertemos para CNY e depois para BRL usando a taxa real.
-const API_INTERNAL_CNY_USD = 7.20; // taxa interna aproximada da csinventoryapi
-
+/**
+ * Converte o valor em USD retornado pela CSInventoryAPI de volta para CNY e depois para BRL.
+ * A CSInventoryAPI converte internamente CNY -> USD usando uma taxa fixa ou de mercado.
+ * Para bater com o Buff/YouPin (que são CNY), precisamos desfazer essa conversão.
+ */
 function toBRL(usdFromAPI) {
   const amount = Number(usdFromAPI);
-  if (!amount) return '0.00';
+  if (!amount || amount === 0) return '0.00';
 
-  if (useDirectCNY) {
-    // Reconverte USD (da API) → CNY → BRL usando taxas reais
-    const cny = amount * API_INTERNAL_CNY_USD;
-    return (cny * CNY_TO_BRL).toFixed(2);
-  }
-  // Fallback: USD direto
-  return (amount * USD_TO_BRL).toFixed(2);
+  // 1. Converter USD (API) -> CNY
+  // Se a API usou 1 USD = 7.24 CNY, então CNY = USD * 7.24
+  const cnyValue = amount / CNY_TO_USD;
+
+  // 2. Converter CNY -> BRL usando taxa real
+  return (cnyValue * CNY_TO_BRL).toFixed(2);
 }
 
-// Mantém a taxa USD para exibição no cabeçalho
 function getDisplayRate() {
-  if (useDirectCNY) return `1 CNY = R$ ${CNY_TO_BRL.toFixed(4)} (via CNY nativo)`;
-  return `1 USD = R$ ${USD_TO_BRL.toFixed(4)}`;
+  return `1 CNY = R$ ${CNY_TO_BRL.toFixed(4)} (Base para Buff/YouPin)`;
 }
 
-// ---------------------------------------------------------
-// BUSCA TODOS OS PREÇOS — 1 request point por source
-// ---------------------------------------------------------
 async function fetchAllPrices(source, apiKey) {
   const cacheKey = `allprices:${source}`;
   const cached   = cache.get(cacheKey);
-  if (cached) { logger.cache(`Preços ${source} (cache)`); return cached; }
+  if (cached) { logger.cache(`Preços ${source} (cache em memória)`); return cached; }
 
   logger.request(`Buscando TODOS os preços: ${source}`);
   const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
@@ -91,20 +78,15 @@ async function fetchAllPrices(source, apiKey) {
 
   const priceMap = new Map();
   for (const [name, info] of Object.entries(data)) {
-    // API retorna centavos em USD → dividir por 100
     const cents = info?.sell_price_cents?.usd ?? 0;
-    priceMap.set(name, cents / 100); // guarda em USD float
+    priceMap.set(name, cents / 100);
   }
 
   logger.success(`${source}: ${priceMap.size} itens carregados`);
-  // Cache 15 min — preços mudam devagar
   cache.set(cacheKey, priceMap, 15 * 60 * 1000);
   return priceMap;
 }
 
-// ---------------------------------------------------------
-// DEDUPLICAÇÃO
-// ---------------------------------------------------------
 function deduplicateItems(items) {
   const grouped = new Map();
   for (const item of items) {
@@ -116,9 +98,6 @@ function deduplicateItems(items) {
   return grouped;
 }
 
-// ---------------------------------------------------------
-// PROCESSAMENTO PRINCIPAL
-// ---------------------------------------------------------
 async function processInventoryPrices(items, apiKey) {
   await fetchExchangeRate();
 
@@ -127,29 +106,25 @@ async function processInventoryPrices(items, apiKey) {
 
   logger.info(`${items.length} itens → ${uniqueNames.length} únicos`);
 
-  // 1 query para buscar TUDO no banco
+  // Busca no banco (cache de 6h)
   const dbBatch = await db.getBatchPricesFromDB(uniqueNames);
   logger.success(`Banco: ${dbBatch.size} itens válidos encontrados`);
 
-  // Apenas itens SEM entrada no banco vão para a API
   const needsAPI = uniqueNames.filter(n => !dbBatch.has(n));
 
   let buffMap   = new Map();
   let youpinMap = new Map();
 
   if (needsAPI.length > 0) {
-    logger.info(`API: ${needsAPI.length} itens sem cache no banco → 2 requests`);
+    logger.info(`API: ${needsAPI.length} itens novos/expirados → Atualizando lista completa`);
     logger.divider();
 
-    // 2 requests para TODO o CS2 — independente do tamanho do inventário
     [buffMap, youpinMap] = await Promise.all([
       fetchAllPrices('buff163', apiKey),
       fetchAllPrices('youpin',  apiKey),
     ]);
 
-    // CORREÇÃO CRÍTICA: salva TODOS os itens, incluindo preço 0
-    // Sem isso, itens sem preço (graffitis, stickers baratos) são re-buscados
-    // na API em CADA execução, gastando tokens desnecessariamente
+    // Salva no banco apenas o que foi solicitado e não estava lá
     const toSave = needsAPI.map(name => ({
       name,
       buff:   buffMap.get(name)   || 0,
@@ -159,37 +134,27 @@ async function processInventoryPrices(items, apiKey) {
     await Promise.all(
       toSave.map(({ name, buff, youpin }) => db.savePriceToDB(name, { buff, youpin }))
     );
-    logger.success(`${toSave.length} itens salvos no banco (incluindo preço zero)`);
-
+    logger.success(`${toSave.length} itens atualizados no banco`);
   } else {
-    logger.info('✅ Todos os preços vieram do banco — 0 requests à API!');
+    logger.info('✅ Cache do banco íntegro (menos de 6h) — 0 requests à API!');
     logger.divider();
   }
 
-  // ---------------------------------------------------------
-  // Monta resultados finais
-  // ---------------------------------------------------------
   const results   = [];
   let totalBuff   = 0;
   let totalYouPin = 0;
 
   for (const name of uniqueNames) {
     const { item, quantity } = grouped.get(name);
-
     let buff, youpin;
 
     if (dbBatch.has(name)) {
-      // Veio do banco
       buff   = dbBatch.get(name).buff;
       youpin = dbBatch.get(name).youpin;
     } else {
-      // Veio da API agora
       buff   = buffMap.get(name)   || 0;
       youpin = youpinMap.get(name) || 0;
     }
-
-    // SEM filtro Anti-Troll — ele causava preços artificiais
-    // Ex: Karambit Fade onde buff=800 e youpin=350 — são preços REAIS diferentes
 
     const buffTotal   = buff   * quantity;
     const youpinTotal = youpin * quantity;
