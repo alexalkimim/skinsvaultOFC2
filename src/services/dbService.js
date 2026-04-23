@@ -1,8 +1,9 @@
-// dbService.js — LIMPO E FOCADO EM USD (Com correção de fuso horário)
+// dbService.js — Cache persistente Supabase (6h por padrão)
 const { Pool } = require('pg');
 const logger   = require('../utils/logger');
 
-const STALE_HOURS = Number(process.env.PRICE_STALE_HOURS || 24);
+// STALE_HOURS padrão = 6h (era 24h — muito longo, causava preços velhos)
+const STALE_HOURS = Number(process.env.PRICE_STALE_HOURS || 6);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -27,7 +28,7 @@ async function setupDatabase() {
       );
       CREATE INDEX IF NOT EXISTS idx_item_prices_usd_name ON item_prices_usd (market_hash_name);
     `);
-    logger.success('Banco de dados (USD) pronto e limpo!');
+    logger.success(`Banco pronto (cache de ${STALE_HOURS}h)`);
   } finally {
     client.release();
   }
@@ -42,7 +43,7 @@ async function savePriceToDB(marketHashName, { buff, youpin }) {
          buff       = EXCLUDED.buff,
          youpin     = EXCLUDED.youpin,
          updated_at = NOW()`,
-      [marketHashName, buff, youpin]
+      [marketHashName, buff || 0, youpin || 0]
     );
   } catch (err) {
     logger.error(`Erro ao salvar "${marketHashName}": ${err.message}`);
@@ -52,8 +53,11 @@ async function savePriceToDB(marketHashName, { buff, youpin }) {
 async function getBatchPricesFromDB(marketHashNames) {
   const result = new Map();
   if (marketHashNames.length === 0) return result;
+
   try {
-    // O PostgreSQL calcula as 24h internamente (imune ao fuso horário do PC)
+    // MUDANÇA: retorna TODOS os itens encontrados (incluindo buff=0 e youpin=0)
+    // Antes só retornava itens com preço > 0, fazendo itens "sem preço" (graffitis,
+    // stickers baratos) serem re-buscados na API a cada execução
     const rows = await pool.query(
       `SELECT market_hash_name, buff, youpin
        FROM item_prices_usd
@@ -61,6 +65,7 @@ async function getBatchPricesFromDB(marketHashNames) {
        AND updated_at >= NOW() - INTERVAL '${STALE_HOURS} hours'`,
       [marketHashNames]
     );
+
     for (const row of rows.rows) {
       result.set(row.market_hash_name, {
         buff:   Number(row.buff),
@@ -70,6 +75,7 @@ async function getBatchPricesFromDB(marketHashNames) {
   } catch (err) {
     logger.error(`Erro ao buscar lote do banco: ${err.message}`);
   }
+
   return result;
 }
 

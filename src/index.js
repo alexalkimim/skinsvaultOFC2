@@ -9,15 +9,15 @@ const logger                             = require('./utils/logger');
 const API_KEY = process.env.CSINVENTORY_API_KEY;
 if (!API_KEY) { logger.error('CSINVENTORY_API_KEY não definida no .env'); process.exit(1); }
 
-function printResults({ results, totalBuffBRL, totalYouPinBRL, usdToBrl, stats }) {
+function printResults({ results, totalBuffBRL, totalYouPinBRL, displayRate, stats }) {
   console.log('\n');
-  logger.banner('RESULTADO (USD -> BRL AO VIVO)');
+  logger.banner('RESULTADO');
   console.log(`  💰  Total BUFF      →  R$ ${Number(totalBuffBRL).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`);
   console.log(`  💰  Total YouPin    →  R$ ${Number(totalYouPinBRL).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`);
-  console.log(`  💱  Câmbio Dólar   →  1 USD = R$ ${usdToBrl.toFixed(3)}`);
-  console.log(`  📊  Fonte          →  ${stats.fromDB} do banco | ${stats.fromAPI} da API\n`);
+  console.log(`  💱  Câmbio         →  ${displayRate}`);
+  console.log(`  📊  Cache          →  ${stats.fromDB} banco | ${stats.fromAPI} API | ${stats.unique} únicos\n`);
   logger.divider();
-  console.log('\n  📦  Itens (ordenado por valor BUFF):\n');
+  console.log('\n  📦  Itens (ordem: maior valor BUFF):\n');
   for (const item of results) {
     const qty  = item.quantity > 1 ? ` ×${item.quantity}` : '';
     const name = item.name.length > 44 ? item.name.slice(0, 41) + '...' : item.name;
@@ -42,7 +42,6 @@ async function main() {
 
   try {
     await setupDatabase();
-
     const steamId = await extractSteamID(input, API_KEY);
     logger.success(`SteamID64: ${steamId}`);
 
@@ -53,7 +52,6 @@ async function main() {
 
     logger.info('Calculando preços...');
     const result = await processInventoryPrices(items, API_KEY);
-
     printResults(result);
 
   } catch (err) {
