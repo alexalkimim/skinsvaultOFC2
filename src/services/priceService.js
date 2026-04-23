@@ -6,37 +6,57 @@ const db     = require('./dbService');
 
 // Taxas de câmbio (Fallbacks caso a API de câmbio falhe)
 let USD_TO_BRL = 6.15; 
+let CNY_TO_BRL = 0.85;
 
-async function fetchExchangeRate() {
+async function fetchExchangeRates() {
+  // Se houver câmbio manual no .env, priorizamos
   if (process.env.CUSTOM_USD_TO_BRL) {
     USD_TO_BRL = Number(process.env.CUSTOM_USD_TO_BRL);
-    logger.success(`Câmbio (Manual .env): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
-    return;
+    logger.success(`Câmbio USD (Manual .env): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+  } else {
+    try {
+      const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 8000 });
+      if (data?.USDBRL?.bid) {
+        USD_TO_BRL = Number(data.USDBRL.bid);
+        logger.success(`Câmbio USD ao vivo → 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+      }
+    } catch {
+      logger.warn(`Câmbio USD não atualizado. Usando fallback: USD=R$ ${USD_TO_BRL}`);
+    }
   }
 
+  // Buscamos CNY (Yuan) para BRL para maior precisão nos preços do Buff/YouPin
   try {
-    const { data } = await axios.get(
-      'https://economia.awesomeapi.com.br/last/USD-BRL',
-      { timeout: 8000 }
-    );
-
-    if (data?.USDBRL?.bid) {
-      USD_TO_BRL = Number(data.USDBRL.bid);
-      logger.success(`Câmbio ao vivo → 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/CNY-BRL', { timeout: 8000 });
+    if (data?.CNYBRL?.bid) {
+      CNY_TO_BRL = Number(data.CNYBRL.bid);
+      logger.success(`Câmbio CNY ao vivo → 1 CNY = R$ ${CNY_TO_BRL.toFixed(4)}`);
     }
   } catch {
-    logger.warn(`Câmbio não atualizado. Usando fallback: USD=R$ ${USD_TO_BRL}`);
+    logger.warn(`Câmbio CNY não atualizado. Usando fallback: CNY=R$ ${CNY_TO_BRL}`);
   }
 }
 
 /**
- * Converte o valor retornado pela API (em USD cents) para BRL.
+ * Converte o valor retornado pela API para BRL com precisão máxima.
+ * A API retorna sell_price_cents que contém sub-campos para várias moedas.
  */
-function toBRL(usdValue) {
-  const amount = Number(usdValue);
-  if (!amount || amount === 0) return 0;
-  // Multiplicação direta do valor em USD pela taxa de câmbio atual
-  return Number((amount * USD_TO_BRL).toFixed(2));
+function calculateBRL(priceInfo) {
+  if (!priceInfo || !priceInfo.sell_price_cents) return 0;
+  
+  const cents = priceInfo.sell_price_cents;
+  
+  // Prioridade 1: CNY (Yuan) - É a moeda nativa do Buff/YouPin, gera menos erro de arredondamento
+  if (cents.cny) {
+    return Number(((cents.cny / 100) * CNY_TO_BRL).toFixed(2));
+  }
+  
+  // Prioridade 2: USD (Dólar)
+  if (cents.usd) {
+    return Number(((cents.usd / 100) * USD_TO_BRL).toFixed(2));
+  }
+
+  return 0;
 }
 
 async function fetchAllPrices(source, apiKey) {
@@ -53,10 +73,9 @@ async function fetchAllPrices(source, apiKey) {
 
     const priceMap = new Map();
     for (const [name, info] of Object.entries(data)) {
-      // A API v2 retorna sell_price_cents.usd (valor em centavos de dólar)
-      const usdPrice = info?.sell_price_cents?.usd;
-      if (usdPrice !== undefined) {
-        priceMap.set(name, usdPrice / 100);
+      // Guardamos o objeto de preço completo para processar com a melhor moeda disponível depois
+      if (info?.sell_price_cents) {
+        priceMap.set(name, info);
       }
     }
 
@@ -81,7 +100,7 @@ function deduplicateItems(items) {
 }
 
 async function processInventoryPrices(items, apiKey) {
-  await fetchExchangeRate();
+  await fetchExchangeRates();
 
   const grouped     = deduplicateItems(items);
   const uniqueNames = [...grouped.keys()];
@@ -104,13 +123,16 @@ async function processInventoryPrices(items, apiKey) {
 
     const toSave = needsAPI.map(name => ({
       name,
-      buff: buffMap.get(name) || 0,
-      youpin: youpinMap.get(name) || 0
+      buffInfo: buffMap.get(name),
+      youpinInfo: youpinMap.get(name)
     }));
 
-    // Salva no banco para as próximas 6 horas
+    // Salva no banco para as próximas 6 horas (armazenamos o preço final em BRL para garantir consistência)
     await Promise.all(
-      toSave.map(data => db.savePriceToDB(data.name, { buff: data.buff, youpin: data.youpin }))
+      toSave.map(data => db.savePriceToDB(data.name, { 
+        buff: calculateBRL(data.buffInfo), 
+        youpin: calculateBRL(data.youpinInfo) 
+      }))
     );
   }
 
@@ -120,30 +142,31 @@ async function processInventoryPrices(items, apiKey) {
 
   for (const name of uniqueNames) {
     const { item, quantity } = grouped.get(name);
-    let buffUSD, youpinUSD;
+    let buffBRLSingle, youpinBRLSingle;
 
     if (dbBatch.has(name)) {
       const data = dbBatch.get(name);
-      buffUSD = data.buff;
-      youpinUSD = data.youpin;
+      buffBRLSingle = data.buff;
+      youpinBRLSingle = data.youpin;
     } else {
-      buffUSD = buffMap.get(name) || 0;
-      youpinUSD = youpinMap.get(name) || 0;
+      buffBRLSingle = calculateBRL(buffMap.get(name));
+      youpinBRLSingle = calculateBRL(youpinMap.get(name));
     }
 
-    const buffBRL = toBRL(buffUSD) * quantity;
-    const youpinBRL = toBRL(youpinUSD) * quantity;
+    const buffBRLTotal = buffBRLSingle * quantity;
+    const youpinBRLTotal = youpinBRLSingle * quantity;
     
-    totalBuffBRL += buffBRL;
-    totalYouPinBRL += youpinBRL;
+    totalBuffBRL += buffBRLTotal;
+    totalYouPinBRL += youpinBRLTotal;
 
     results.push({
       name: item.name || name,
       quantity,
-      buffBRL: buffBRL.toFixed(2),
-      youpinBRL: youpinBRL.toFixed(2),
-      buffUSD: (buffUSD * quantity).toFixed(2),
-      youpinUSD: (youpinUSD * quantity).toFixed(2)
+      buffBRL: buffBRLTotal.toFixed(2),
+      youpinBRL: youpinBRLTotal.toFixed(2),
+      // Mantemos USD apenas para exibição aproximada
+      buffUSD: ((buffBRLTotal) / USD_TO_BRL).toFixed(2),
+      youpinUSD: ((youpinBRLTotal) / USD_TO_BRL).toFixed(2)
     });
   }
 
@@ -154,7 +177,7 @@ async function processInventoryPrices(items, apiKey) {
     results,
     totalBuffBRL: totalBuffBRL.toFixed(2),
     totalYouPinBRL: totalYouPinBRL.toFixed(2),
-    displayRate: `1 USD = R$ ${USD_TO_BRL.toFixed(4)}`,
+    displayRate: `1 USD = R$ ${USD_TO_BRL.toFixed(2)} | 1 CNY = R$ ${CNY_TO_BRL.toFixed(4)}`,
     stats: {
       total: items.length,
       unique: uniqueNames.length,

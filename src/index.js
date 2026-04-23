@@ -9,6 +9,23 @@ const logger                             = require('./utils/logger');
 const API_KEY = process.env.CSINVENTORY_API_KEY;
 if (!API_KEY) { logger.error('CSINVENTORY_API_KEY não definida no .env'); process.exit(1); }
 
+function printDiagnosticReport(stats, error = null) {
+  console.log('\n' + '='.repeat(50));
+  console.log('📋 RELATÓRIO DE DIAGNÓSTICO (COPIE E COLE PARA O MANUS)');
+  console.log('='.repeat(50));
+  const report = {
+    status: error ? 'ERRO' : 'OK',
+    error: error ? error.message : null,
+    itens_totais: stats?.total || 0,
+    itens_unicos: stats?.unique || 0,
+    origem: { banco: stats?.fromDB || 0, api: stats?.fromAPI || 0 },
+    cambio: stats?.displayRate || 'N/A',
+    timestamp: new Date().toISOString()
+  };
+  console.log(JSON.stringify(report, null, 2));
+  console.log('='.repeat(50) + '\n');
+}
+
 function printResults({ results, totalBuffBRL, totalYouPinBRL, displayRate, stats }) {
   console.log('\n');
   logger.banner('RESULTADO FINAL');
@@ -18,6 +35,12 @@ function printResults({ results, totalBuffBRL, totalYouPinBRL, displayRate, stat
   console.log(`  📊  Estatísticas   →  ${stats.total} itens | ${stats.unique} únicos | ${stats.fromDB} do banco`);
   
   logger.divider();
+  
+  // Se o usuário passar a flag --debug ou houver erro, mostramos o diagnóstico
+  if (process.argv.includes('--diag') || stats.total === 0) {
+    printDiagnosticReport({ ...stats, displayRate });
+  }
+
   console.log('\n  📦  Itens (ordem: maior valor BUFF):\n');
   
   for (const item of results) {
@@ -60,6 +83,7 @@ async function main() {
 
   } catch (err) {
     logger.error(err.message);
+    printDiagnosticReport(null, err);
     if (process.env.DEBUG === 'true') console.error(err);
   } finally {
     await closeDB();
