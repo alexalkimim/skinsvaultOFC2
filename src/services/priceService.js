@@ -1,12 +1,4 @@
-// priceService.js — MEGA OTIMIZADO: 2 requests para TODO o inventário
-//
-// Como funciona:
-//   GET /api/v2/prices?source=buff163  → retorna TODOS os itens (1 request point)
-//   GET /api/v2/prices?source=youpin   → retorna TODOS os itens (1 request point)
-//   Total: 2 requests independente do tamanho do inventário!
-//
-// Preços da API vêm em CENTAVOS → dividir por 100 para ter USD
-
+// priceService.js — OTIMIZADO COM YUAN (CNY)
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
@@ -14,27 +6,22 @@ const db     = require('./dbService');
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Câmbio USD → BRL
-let USD_TO_BRL = 5.70;
+// Câmbio CNY → BRL
+let CNY_TO_BRL = 0.80; // Fallback inicial (1 CNY ~= 0.80 BRL)
 
 async function fetchExchangeRate() {
   try {
-    const { data } = await axios.get('https://api.exchangerate-api.com/v4/latest/USD', { timeout: 8000 });
+    const { data } = await axios.get('https://api.exchangerate-api.com/v4/latest/CNY', { timeout: 8000 });
     if (data?.rates?.BRL) {
-      USD_TO_BRL = data.rates.BRL;
-      logger.success(`Câmbio: 1 USD = R$ ${USD_TO_BRL.toFixed(2)}`);
+      CNY_TO_BRL = data.rates.BRL;
+      logger.success(`Câmbio: 1 CNY = R$ ${CNY_TO_BRL.toFixed(3)}`);
     }
   } catch {
-    logger.warn(`Câmbio não atualizado. Usando R$ ${USD_TO_BRL.toFixed(2)}`);
+    logger.warn(`Câmbio não atualizado. Usando R$ ${CNY_TO_BRL.toFixed(3)}`);
   }
 }
 
-const toBRL = (usd) => (Number(usd) * USD_TO_BRL).toFixed(2);
-
-// ---------------------------------------------------------
-// BUSCA TODOS OS PREÇOS DE UMA VEZ — 1 request point!
-// Retorna Map: market_hash_name → preço em USD (float)
-// ---------------------------------------------------------
+const toBRL = (cny) => (Number(cny) * CNY_TO_BRL).toFixed(2);
 
 async function fetchAllPrices(source, apiKey) {
   const cacheKey = `allprices:${source}`;
@@ -43,28 +30,33 @@ async function fetchAllPrices(source, apiKey) {
 
   logger.request(`Buscando TODOS os preços: ${source}`);
   const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
-    timeout: 60000, // resposta grande, timeout maior
+    timeout: 60000,
     params: { api_key: apiKey, source, app_id: 730 },
   });
 
-  // Converte para Map: name → preço em USD
-  // API retorna centavos → dividir por 100
   const priceMap = new Map();
   for (const [name, info] of Object.entries(data)) {
-    const cents = info?.sell_price_cents?.usd ?? 0;
-    priceMap.set(name, cents / 100);
+    let cnyPrice = 0;
+    
+    // Tenta pegar o CNY direto se a API enviar (muitas APIs enviam "cny" oculto)
+    if (info?.sell_price_cents?.cny) {
+      cnyPrice = info.sell_price_cents.cny / 100;
+    } 
+    // Fallback: Se enviar apenas USD, revertemos a conversão pro valor original do Buff
+    else if (info?.sell_price_cents?.usd) {
+      const usdPrice = info.sell_price_cents.usd / 100;
+      // 7.22 é a taxa média do dólar/rmb usada nos sites chineses. 
+      // Caso precise ajustar a precisão, basta alterar este número (ex: 7.23, 7.25)
+      cnyPrice = usdPrice * 7.22; 
+    }
+
+    priceMap.set(name, cnyPrice);
   }
 
   logger.success(`${source}: ${priceMap.size} itens carregados`);
-
-  // Cache por 15 minutos (preços mudam lentamente)
   cache.set(cacheKey, priceMap, 15 * 60 * 1000);
   return priceMap;
 }
-
-// ---------------------------------------------------------
-// DEDUPLICAÇÃO
-// ---------------------------------------------------------
 
 function deduplicateItems(items) {
   const grouped = new Map();
@@ -77,12 +69,7 @@ function deduplicateItems(items) {
   return grouped;
 }
 
-// ---------------------------------------------------------
-// PROCESSAMENTO PRINCIPAL
-// ---------------------------------------------------------
-
 async function processInventoryPrices(items, apiKey) {
-  // 1. Atualiza câmbio
   await fetchExchangeRate();
 
   const grouped     = deduplicateItems(items);
@@ -90,12 +77,9 @@ async function processInventoryPrices(items, apiKey) {
 
   logger.info(`${items.length} itens → ${uniqueNames.length} únicos`);
 
-  // 2. Verifica banco (1 query para tudo)
-  logger.info('Verificando banco de dados...');
   const dbBatch = await db.getBatchPricesFromDB(uniqueNames);
   logger.success(`Banco: ${dbBatch.size} itens válidos encontrados`);
 
-  // Itens que precisam de preço fresco da API
   const needsAPI = uniqueNames.filter(n => !dbBatch.has(n));
 
   let buffMap   = new Map();
@@ -105,13 +89,11 @@ async function processInventoryPrices(items, apiKey) {
     logger.info(`API: buscando preços para ${needsAPI.length} itens não cacheados`);
     logger.divider();
 
-    // 3. APENAS 2 REQUESTS para TODO o inventário
     [buffMap, youpinMap] = await Promise.all([
       fetchAllPrices('buff163', apiKey),
       fetchAllPrices('youpin',  apiKey),
     ]);
 
-    // 4. Salva novos preços no banco
     const toSave = [];
     for (const name of needsAPI) {
       const buff   = buffMap.get(name)   || 0;
@@ -133,7 +115,6 @@ async function processInventoryPrices(items, apiKey) {
     logger.divider();
   }
 
-  // 5. Monta resultados
   const results   = [];
   let totalBuff   = 0;
   let totalYouPin = 0;
@@ -141,7 +122,6 @@ async function processInventoryPrices(items, apiKey) {
   for (const name of uniqueNames) {
     const { item, quantity } = grouped.get(name);
 
-    // Prioridade: banco → mapa da API → 0
     let buff   = 0;
     let youpin = 0;
 
@@ -163,6 +143,8 @@ async function processInventoryPrices(items, apiKey) {
       quantity,
       buffBRL:   toBRL(buffTotal),
       youpinBRL: toBRL(youpinTotal),
+      buffCNY:   buffTotal.toFixed(2),
+      youpinCNY: youpinTotal.toFixed(2),
     });
   }
 
@@ -173,7 +155,7 @@ async function processInventoryPrices(items, apiKey) {
     results,
     totalBuffBRL:   toBRL(totalBuff),
     totalYouPinBRL: toBRL(totalYouPin),
-    usdToBRL:       USD_TO_BRL,
+    cnyToBRL:       CNY_TO_BRL,
     stats: {
       total:   items.length,
       unique:  uniqueNames.length,

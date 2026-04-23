@@ -17,17 +17,18 @@ pool.on('error', (err) => logger.error(`Pool error: ${err.message}`));
 async function setupDatabase() {
   const client = await pool.connect();
   try {
+    // Tabela nova específica para valores em CNY para evitar conflito com os USD antigos
     await client.query(`
-      CREATE TABLE IF NOT EXISTS item_prices (
+      CREATE TABLE IF NOT EXISTS item_prices_cny (
         id               SERIAL PRIMARY KEY,
         market_hash_name TEXT UNIQUE NOT NULL,
-        buff_usd         NUMERIC(12, 4) DEFAULT 0,
-        youpin_usd       NUMERIC(12, 4) DEFAULT 0,
+        buff_cny         NUMERIC(12, 4) DEFAULT 0,
+        youpin_cny       NUMERIC(12, 4) DEFAULT 0,
         updated_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
-      CREATE INDEX IF NOT EXISTS idx_item_prices_name ON item_prices (market_hash_name);
+      CREATE INDEX IF NOT EXISTS idx_item_prices_cny_name ON item_prices_cny (market_hash_name);
     `);
-    logger.success('Banco de dados pronto');
+    logger.success('Banco de dados (CNY) pronto');
   } finally {
     client.release();
   }
@@ -36,11 +37,11 @@ async function setupDatabase() {
 async function savePriceToDB(marketHashName, { buff, youpin }) {
   try {
     await pool.query(
-      `INSERT INTO item_prices (market_hash_name, buff_usd, youpin_usd, updated_at)
+      `INSERT INTO item_prices_cny (market_hash_name, buff_cny, youpin_cny, updated_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (market_hash_name) DO UPDATE SET
-         buff_usd   = EXCLUDED.buff_usd,
-         youpin_usd = EXCLUDED.youpin_usd,
+         buff_cny   = EXCLUDED.buff_cny,
+         youpin_cny = EXCLUDED.youpin_cny,
          updated_at = NOW()`,
       [marketHashName, buff, youpin]
     );
@@ -55,15 +56,15 @@ async function getBatchPricesFromDB(marketHashNames) {
   try {
     const staleThreshold = Date.now() - STALE_HOURS * 60 * 60 * 1000;
     const rows = await pool.query(
-      `SELECT market_hash_name, buff_usd, youpin_usd, updated_at
-       FROM item_prices WHERE market_hash_name = ANY($1)`,
+      `SELECT market_hash_name, buff_cny, youpin_cny, updated_at
+       FROM item_prices_cny WHERE market_hash_name = ANY($1)`,
       [marketHashNames]
     );
     for (const row of rows.rows) {
       if (new Date(row.updated_at).getTime() >= staleThreshold) {
         result.set(row.market_hash_name, {
-          buff:   Number(row.buff_usd),
-          youpin: Number(row.youpin_usd),
+          buff:   Number(row.buff_cny),
+          youpin: Number(row.youpin_cny),
         });
       }
     }
