@@ -45,60 +45,37 @@ async function extractSteamID(input, apiKey) {
 }
 
 function parseInventoryResponse(data) {
-  // Se a API retornar um array direto de itens (comum em algumas rotas da v2)
-  if (Array.isArray(data)) {
-    return data.map(item => ({
-      assetid: item.assetid || item.id,
-      market_hash_name: item.market_hash_name,
-      name: item.name || item.market_hash_name
-    })).filter(i => i.market_hash_name);
-  }
-
+  // CORREÇÃO: Algumas rotas da v2 retornam o array direto, outras dentro de .data
+  const rawItems = Array.isArray(data) ? data : (data.assets || data.inventory || data.data || []);
+  
   const descMap = {};
-  // Mapeia descrições por classid e instanceid
   for (const d of (data.descriptions || [])) {
     const key = `${d.classid}_${d.instanceid || '0'}`;
     descMap[key] = d;
   }
 
   const items = [];
-  // Suporte a 'assets' ou 'inventory' conforme a versão da API v2
-  const assets = data.assets || data.inventory || [];
+  for (const asset of rawItems) {
+    // Se o item já vier com o nome (comum na v2), usamos direto
+    let marketHashName = asset.market_hash_name;
+    let displayName = asset.name || asset.market_hash_name;
 
-  for (const asset of assets) {
-    const key  = `${asset.classid}_${asset.instanceid || '0'}`;
-    const desc = descMap[key];
-
-    // Se não achar pela chave composta, tenta só pelo classid (comum em alguns itens da v2)
-    const finalDesc = desc || (data.descriptions || []).find(d => String(d.classid) === String(asset.classid));
-
-    // Lógica agressiva para encontrar o market_hash_name (especialmente para Grafites/Sprays)
-    let marketHashName = asset.market_hash_name || finalDesc?.market_hash_name;
-    let displayName = asset.name || finalDesc?.name || marketHashName;
-
-    // Caso especial para Grafites que não têm market_hash_name direto:
-    // Às vezes o nome está em tags (Type=Graffiti, Graffiti Color=...)
-    if (!marketHashName && finalDesc?.tags) {
-      const typeTag = finalDesc.tags.find(t => t.category === 'Type');
-      const colorTag = finalDesc.tags.find(t => t.category === 'SprayColorCategory');
-      if (typeTag && colorTag) {
-        // Ex: Sealed Graffiti | [Pattern Name] (Shark White)
-        // Isso é um fallback, o ideal é o market_hash_name
-        marketHashName = `${typeTag.name} | (Shark White)`; // Exemplo simplificado
-      }
-    }
-
+    // Se não tiver nome, tenta buscar nas descrições (comum na v1)
     if (!marketHashName) {
-      logger.debug(`Item ignorado (sem identificação): Asset ${asset.assetid} | Class ${asset.classid}`);
-      continue;
+      const key = `${asset.classid}_${asset.instanceid || '0'}`;
+      const desc = descMap[key] || (data.descriptions || []).find(d => String(d.classid) === String(asset.classid));
+      marketHashName = desc?.market_hash_name;
+      displayName = desc?.name || marketHashName;
     }
+
+    if (!marketHashName) continue;
 
     const amount = parseInt(asset.amount, 10) || 1;
     for (let i = 0; i < amount; i++) {
       items.push({
-        assetid: asset.assetid,
+        assetid: asset.assetid || asset.id,
         market_hash_name: marketHashName,
-        name: displayName || marketHashName
+        name: displayName
       });
     }
   }
@@ -108,7 +85,10 @@ function parseInventoryResponse(data) {
 async function fetchInventory(steamId, apiKey) {
   const cacheKey = `inventory:${steamId}`;
   const cached   = cache.get(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+      logger.cache(`Inventário carregado do cache local (${cached.length} itens).`);
+      return cached;
+  }
 
   const tradelink = tradeLinkMemory.get(steamId);
   let data;
@@ -119,35 +99,36 @@ async function fetchInventory(steamId, apiKey) {
     try {
       const res = await axios.get('https://csinventoryapi.com/api/v2/inventory', {
         timeout: 45000,
-        params: { api_key: apiKey, tradelink: encodeURIComponent(tradelink), appid: 730 },
+        // Algumas versões usam 'url', outras 'tradelink'. Mandamos ambos.
+        params: { api_key: apiKey, url: tradelink, tradelink: tradelink, appid: 730 },
       });
       
       const resData = res.data;
-      const count = (resData?.assets || resData?.inventory || (Array.isArray(resData) ? resData : [])).length;
-
-      if (count > 0) {
+      // CORREÇÃO: Verificamos se há itens em .assets, .inventory ou .data (que vimos no seu log)
+      const itemsFound = resData?.assets || resData?.inventory || resData?.data || (Array.isArray(resData) ? resData : []);
+      
+      if (itemsFound && itemsFound.length > 0) {
         data = resData;
-        logger.success(`✅ SUCESSO: ${count} itens via Trade Link (API v2)`);
+        logger.success(`✅ SUCESSO: ${itemsFound.length} itens via Trade Link (API v2)`);
       } else {
-        logger.warn(`API v2 vazia ou erro: ${resData?.message || 'Nenhum item'}. Tentando v1...`);
+        logger.warn(`API v2 não retornou itens úteis. Tentando v1...`);
       }
     } catch (err) {
       logger.error(`Erro na API v2: ${err.response?.data?.message || err.message}. Tentando v1...`);
     }
   }
 
-  // TENTATIVA 2: API v1 (Fallback automático se a v2 falhar)
+  // TENTATIVA 2: API v1 (Fallback)
   if (!data) {
     logger.request(`Buscando via SteamID (API v1)...`);
     try {
       const res = await axios.get('https://csinventoryapi.com/api/v1/inventory', {
         timeout: 25000,
-        params: { api_key: apiKey, steamid64: steamId, appid: 730, contextid: 2 },
+        params: { api_key: apiKey, steamid64: steamId, appid: 730, contextid: 2, t: Date.now() },
       });
       if (res.data?.assets?.length > 0 || res.data?.inventory?.length > 0) {
         data = res.data;
-        const count = (data.assets || data.inventory).length;
-        logger.success(`Inventário capturado via API v1 (${count} itens)`);
+        logger.success(`Inventário capturado via API v1`);
       }
     } catch (err) {
       logger.error(`Falha crítica na API v1: ${err.response?.data?.message || err.message}`);
@@ -155,19 +136,19 @@ async function fetchInventory(steamId, apiKey) {
   }
 
   if (!data) {
-    throw new Error('ERRO: Não foi possível capturar os itens em nenhuma API. Verifique se o inventário está PÚBLICO na Steam.');
+    throw new Error('ERRO: Não foi possível capturar os itens em nenhuma API.');
   }
 
   const items = parseInventoryResponse(data);
   
   if (items.length === 0) {
-    throw new Error('ERRO: Inventário processado está vazio. Verifique se o usuário possui itens de CS2.');
+    throw new Error('ERRO: Inventário processado está vazio.');
   }
 
   logger.info(`Total de itens processados: ${items.length}`);
   
-  // Cache de 6 horas para o inventário
-  cache.set(cacheKey, items, 6 * 60 * 60 * 1000);
+  // Cache curto (1 min) para garantir que você veja itens saindo do lock rápido
+  cache.set(cacheKey, items, 1 * 60 * 1000);
   return items;
 }
 

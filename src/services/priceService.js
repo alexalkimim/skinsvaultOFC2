@@ -1,91 +1,59 @@
-// priceService.js — PRECISÃO MÁXIMA
+// priceService.js — PRECISÃO DE MERCADO BRASILEIRO (SALDO BUFF)
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
 const db     = require('./dbService');
 
-// Taxas de câmbio (Fallbacks caso a API de câmbio falhe)
-let USD_TO_BRL = 6.15; 
-let CNY_TO_BRL = 0.85;
+// Fator de descompressão da API (reverte o Dólar inflacionado para a raiz em Yuan)
+const BUFF_INTERNAL_USD_TO_CNY = 6.445; 
 
-async function fetchExchangeRates() {
-  // Se houver câmbio manual no .env, priorizamos
-  if (process.env.CUSTOM_USD_TO_BRL) {
-    USD_TO_BRL = Number(process.env.CUSTOM_USD_TO_BRL);
-    logger.success(`Câmbio USD (Manual .env): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+// Cotação padrão do Saldo Buff no Brasil (Ajustável via .env)
+let BUFF_BALANCE_RATE = 0.7286; 
+
+async function fetchExchangeRate() {
+  if (process.env.BUFF_BALANCE_RATE) {
+    BUFF_BALANCE_RATE = Number(process.env.BUFF_BALANCE_RATE);
+    logger.success(`Câmbio (Saldo Buff .env): 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`);
   } else {
-    try {
-      const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 8000 });
-      if (data?.USDBRL?.bid) {
-        USD_TO_BRL = Number(data.USDBRL.bid);
-        logger.success(`Câmbio USD ao vivo → 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
-      }
-    } catch {
-      logger.warn(`Câmbio USD não atualizado. Usando fallback: USD=R$ ${USD_TO_BRL}`);
-    }
-  }
-
-  // Buscamos CNY (Yuan) para BRL para maior precisão nos preços do Buff/YouPin
-  try {
-    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/CNY-BRL', { timeout: 8000 });
-    if (data?.CNYBRL?.bid) {
-      CNY_TO_BRL = Number(data.CNYBRL.bid);
-      logger.success(`Câmbio CNY ao vivo → 1 CNY = R$ ${CNY_TO_BRL.toFixed(4)}`);
-    }
-  } catch {
-    logger.warn(`Câmbio CNY não atualizado. Usando fallback: CNY=R$ ${CNY_TO_BRL}`);
+    logger.success(`Câmbio (Saldo Buff Calibrado): 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`);
   }
 }
 
-/**
- * Converte o valor retornado pela API para BRL com precisão máxima.
- * A API retorna sell_price_cents que contém sub-campos para várias moedas.
- */
-function calculateBRL(priceInfo) {
-  if (!priceInfo || !priceInfo.sell_price_cents) return 0;
-  
-  const cents = priceInfo.sell_price_cents;
-  
-  // Prioridade 1: CNY (Yuan) - É a moeda nativa do Buff/YouPin, gera menos erro de arredondamento
-  if (cents.cny) {
-    return Number(((cents.cny / 100) * CNY_TO_BRL).toFixed(2));
-  }
-  
-  // Prioridade 2: USD (Dólar)
-  if (cents.usd) {
-    return Number(((cents.usd / 100) * USD_TO_BRL).toFixed(2));
-  }
-
-  return 0;
+// A MÁGICA: Transforma o USD da API no BRL verdadeiro do mercado de skins
+function usdToRealBRL(fakeUsd) {
+  const trueCNY = Number(fakeUsd) * BUFF_INTERNAL_USD_TO_CNY;
+  return (trueCNY * BUFF_BALANCE_RATE).toFixed(2);
 }
 
 async function fetchAllPrices(source, apiKey) {
-  const cacheKey = `allprices:${source}`;
+  const cacheKey = `allprices_usd:${source}`;
   const cached   = cache.get(cacheKey);
-  if (cached) return cached;
+  if (cached) { logger.cache(`Preços ${source} (cache)`); return cached; }
 
-  logger.request(`Buscando lista de preços: ${source}`);
-  try {
-    const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
-      timeout: 60000,
-      params: { api_key: apiKey, source, app_id: 730 },
-    });
+  logger.request(`Buscando TODOS os preços: ${source}`);
+  const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
+    timeout: 60000,
+    params: { api_key: apiKey, source, app_id: 730 },
+  });
 
-    const priceMap = new Map();
-    for (const [name, info] of Object.entries(data)) {
-      // Guardamos o objeto de preço completo para processar com a melhor moeda disponível depois
-      if (info?.sell_price_cents) {
-        priceMap.set(name, info);
-      }
+  const pricesObj = data.data || data.items || data;
+  const priceMap = new Map();
+
+  for (const [name, info] of Object.entries(pricesObj)) {
+    if (name === 'success') continue;
+
+    let priceUSD = 0;
+    if (info?.sell_price_cents?.usd) {
+      priceUSD = Number(info.sell_price_cents.usd) / 100;
+    } else if (info?.sell_price) {
+      priceUSD = Number(info.sell_price);
     }
-
-    logger.success(`${source}: ${priceMap.size} preços carregados`);
-    cache.set(cacheKey, priceMap, 15 * 60 * 1000);
-    return priceMap;
-  } catch (err) {
-    logger.error(`Erro ao buscar preços da API (${source}): ${err.message}`);
-    return new Map();
+    priceMap.set(name, priceUSD);
   }
+
+  logger.success(`${source}: ${priceMap.size} preços carregados`);
+  cache.set(cacheKey, priceMap, 15 * 60 * 1000);
+  return priceMap;
 }
 
 function deduplicateItems(items) {
@@ -100,14 +68,11 @@ function deduplicateItems(items) {
 }
 
 async function processInventoryPrices(items, apiKey) {
-  await fetchExchangeRates();
+  await fetchExchangeRate();
 
   const grouped     = deduplicateItems(items);
   const uniqueNames = [...grouped.keys()];
 
-  logger.info(`${items.length} itens totais → ${uniqueNames.length} itens únicos`);
-
-  // Busca no banco de dados (cache de 6h)
   const dbBatch = await db.getBatchPricesFromDB(uniqueNames);
   const needsAPI = uniqueNames.filter(n => !dbBatch.has(n));
 
@@ -115,73 +80,66 @@ async function processInventoryPrices(items, apiKey) {
   let youpinMap = new Map();
 
   if (needsAPI.length > 0) {
-    logger.info(`API: Buscando preços para ${needsAPI.length} itens novos...`);
+    logger.info(`API: Buscando preços para ${needsAPI.length} itens...`);
     [buffMap, youpinMap] = await Promise.all([
       fetchAllPrices('buff163', apiKey),
       fetchAllPrices('youpin',  apiKey),
     ]);
 
-    const toSave = needsAPI.map(name => ({
-      name,
-      buffInfo: buffMap.get(name),
-      youpinInfo: youpinMap.get(name)
-    }));
+    const toSave = [];
+    for (const name of needsAPI) {
+      const buff   = buffMap.get(name)   || 0;
+      const youpin = youpinMap.get(name) || 0;
+      if (buff > 0 || youpin > 0) toSave.push({ name, buff, youpin });
+    }
 
-    // Salva no banco para as próximas 6 horas (armazenamos o preço final em BRL para garantir consistência)
-    await Promise.all(
-      toSave.map(data => db.savePriceToDB(data.name, { 
-        buff: calculateBRL(data.buffInfo), 
-        youpin: calculateBRL(data.youpinInfo) 
-      }))
-    );
+    if (toSave.length > 0) {
+      await Promise.all(toSave.map(({ name, buff, youpin }) =>
+        db.savePriceToDB(name, { buff, youpin })
+      ));
+    }
   }
 
   const results   = [];
-  let totalBuffBRL   = 0;
-  let totalYouPinBRL = 0;
+  let totalBuffUSD   = 0;
+  let totalYouPinUSD = 0;
 
   for (const name of uniqueNames) {
     const { item, quantity } = grouped.get(name);
-    let buffBRLSingle, youpinBRLSingle;
 
-    if (dbBatch.has(name)) {
-      const data = dbBatch.get(name);
-      buffBRLSingle = data.buff;
-      youpinBRLSingle = data.youpin;
-    } else {
-      buffBRLSingle = calculateBRL(buffMap.get(name));
-      youpinBRLSingle = calculateBRL(youpinMap.get(name));
-    }
+    let buffUSD   = dbBatch.has(name) ? dbBatch.get(name).buff : (buffMap.get(name) || 0);
+    let youpinUSD = dbBatch.has(name) ? dbBatch.get(name).youpin : (youpinMap.get(name) || 0);
 
-    const buffBRLTotal = buffBRLSingle * quantity;
-    const youpinBRLTotal = youpinBRLSingle * quantity;
+    if (buffUSD > 0 && (youpinUSD > buffUSD * 2 || youpinUSD === 0)) youpinUSD = buffUSD; 
+    else if (youpinUSD > 0 && (buffUSD > youpinUSD * 2 || buffUSD === 0)) buffUSD = youpinUSD;
+
+    const buffTotalUSD   = buffUSD   * quantity;
+    const youpinTotalUSD = youpinUSD * quantity;
     
-    totalBuffBRL += buffBRLTotal;
-    totalYouPinBRL += youpinBRLTotal;
+    totalBuffUSD   += buffTotalUSD;
+    totalYouPinUSD += youpinTotalUSD;
 
     results.push({
-      name: item.name || name,
+      name:      item.name || name,
       quantity,
-      buffBRL: buffBRLTotal.toFixed(2),
-      youpinBRL: youpinBRLTotal.toFixed(2),
-      // Mantemos USD apenas para exibição aproximada
-      buffUSD: ((buffBRLTotal) / USD_TO_BRL).toFixed(2),
-      youpinUSD: ((youpinBRLTotal) / USD_TO_BRL).toFixed(2)
+      buffBRL:   usdToRealBRL(buffTotalUSD),
+      youpinBRL: usdToRealBRL(youpinTotalUSD),
+      buffUSD:   buffTotalUSD.toFixed(2),
+      youpinUSD: youpinTotalUSD.toFixed(2),
     });
   }
 
-  // Ordena por valor total (BRL) decrescente
   results.sort((a, b) => Number(b.buffBRL) - Number(a.buffBRL));
 
   return {
     results,
-    totalBuffBRL: totalBuffBRL.toFixed(2),
-    totalYouPinBRL: totalYouPinBRL.toFixed(2),
-    displayRate: `1 USD = R$ ${USD_TO_BRL.toFixed(2)} | 1 CNY = R$ ${CNY_TO_BRL.toFixed(4)}`,
+    totalBuffBRL:   usdToRealBRL(totalBuffUSD),
+    totalYouPinBRL: usdToRealBRL(totalYouPinUSD),
+    displayRate:    `Mercado Real (Saldo Buff) → 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`,
     stats: {
-      total: items.length,
-      unique: uniqueNames.length,
-      fromDB: dbBatch.size,
+      total:   items.length,
+      unique:  uniqueNames.length,
+      fromDB:  dbBatch.size,
       fromAPI: needsAPI.length,
     },
   };
