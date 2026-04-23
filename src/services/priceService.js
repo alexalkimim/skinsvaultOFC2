@@ -1,27 +1,40 @@
-// priceService.js — OTIMIZADO COM YUAN (CNY)
+// priceService.js — PRECISO (USD Direto -> BRL Ao Vivo + Spread)
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
 const db     = require('./dbService');
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// Câmbio CNY → BRL
-let CNY_TO_BRL = 0.80; // Fallback inicial (1 CNY ~= 0.80 BRL)
+const SPREAD_PERCENT = Number(process.env.BRL_SPREAD_PERCENT) || 0;
+let USD_TO_BRL = 5.00; // Fallback
 
 async function fetchExchangeRate() {
+  if (process.env.CUSTOM_USD_TO_BRL) {
+    USD_TO_BRL = Number(process.env.CUSTOM_USD_TO_BRL);
+    logger.success(`Câmbio (Manual .env): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+    return;
+  }
+
   try {
-    const { data } = await axios.get('https://api.exchangerate-api.com/v4/latest/CNY', { timeout: 8000 });
-    if (data?.rates?.BRL) {
-      CNY_TO_BRL = data.rates.BRL;
-      logger.success(`Câmbio: 1 CNY = R$ ${CNY_TO_BRL.toFixed(3)}`);
+    // Puxando DÓLAR para REAL ao vivo (atualiza a cada 30 segundos)
+    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 8000 });
+    if (data?.USDBRL?.bid) {
+      const baseRate = Number(data.USDBRL.bid);
+      
+      // Aplica a taxa da sua extensão (Spread) em cima do dólar comercial
+      USD_TO_BRL = baseRate + (baseRate * (SPREAD_PERCENT / 100));
+      
+      if (SPREAD_PERCENT > 0) {
+        logger.success(`Câmbio (Ao Vivo + ${SPREAD_PERCENT}% Spread): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+      } else {
+        logger.success(`Câmbio (Ao Vivo Comercial): 1 USD = R$ ${USD_TO_BRL.toFixed(4)}`);
+      }
     }
-  } catch {
-    logger.warn(`Câmbio não atualizado. Usando R$ ${CNY_TO_BRL.toFixed(3)}`);
+  } catch (err) {
+    logger.warn(`Câmbio não atualizado. Usando último valor: R$ ${USD_TO_BRL.toFixed(4)}`);
   }
 }
 
-const toBRL = (cny) => (Number(cny) * CNY_TO_BRL).toFixed(2);
+const toBRL = (usd) => (Number(usd) * USD_TO_BRL).toFixed(2);
 
 async function fetchAllPrices(source, apiKey) {
   const cacheKey = `allprices:${source}`;
@@ -36,21 +49,12 @@ async function fetchAllPrices(source, apiKey) {
 
   const priceMap = new Map();
   for (const [name, info] of Object.entries(data)) {
-    let cnyPrice = 0;
-    
-    // Tenta pegar o CNY direto se a API enviar (muitas APIs enviam "cny" oculto)
-    if (info?.sell_price_cents?.cny) {
-      cnyPrice = info.sell_price_cents.cny / 100;
-    } 
-    // Fallback: Se enviar apenas USD, revertemos a conversão pro valor original do Buff
-    else if (info?.sell_price_cents?.usd) {
-      const usdPrice = info.sell_price_cents.usd / 100;
-      // 7.22 é a taxa média do dólar/rmb usada nos sites chineses. 
-      // Caso precise ajustar a precisão, basta alterar este número (ex: 7.23, 7.25)
-      cnyPrice = usdPrice * 7.22; 
+    // A API fornece os centavos em Dólar (usd). Essa é a fonte mais pura.
+    if (info?.sell_price_cents?.usd) {
+      priceMap.set(name, info.sell_price_cents.usd / 100);
+    } else {
+      priceMap.set(name, 0);
     }
-
-    priceMap.set(name, cnyPrice);
   }
 
   logger.success(`${source}: ${priceMap.size} itens carregados`);
@@ -104,7 +108,6 @@ async function processInventoryPrices(items, apiKey) {
     }
 
     if (toSave.length > 0) {
-      logger.info(`Salvando ${toSave.length} preços no banco...`);
       await Promise.all(toSave.map(({ name, buff, youpin }) =>
         db.savePriceToDB(name, { buff, youpin })
       ));
@@ -133,6 +136,10 @@ async function processInventoryPrices(items, apiKey) {
       youpin = youpinMap.get(name) || 0;
     }
 
+    // Filtro Anti-Troll (Iguala discrepâncias absurdas)
+    if (buff > 0 && (youpin > buff * 2 || youpin === 0)) youpin = buff; 
+    else if (youpin > 0 && (buff > youpin * 2 || buff === 0)) buff = youpin;
+
     const buffTotal   = buff   * quantity;
     const youpinTotal = youpin * quantity;
     totalBuff   += buffTotal;
@@ -143,19 +150,18 @@ async function processInventoryPrices(items, apiKey) {
       quantity,
       buffBRL:   toBRL(buffTotal),
       youpinBRL: toBRL(youpinTotal),
-      buffCNY:   buffTotal.toFixed(2),
-      youpinCNY: youpinTotal.toFixed(2),
+      buffUSD:   buffTotal.toFixed(2),
+      youpinUSD: youpinTotal.toFixed(2),
     });
   }
 
-  // Ordena por valor BUFF (maior → menor)
   results.sort((a, b) => Number(b.buffBRL) - Number(a.buffBRL));
 
   return {
     results,
     totalBuffBRL:   toBRL(totalBuff),
     totalYouPinBRL: toBRL(totalYouPin),
-    cnyToBRL:       CNY_TO_BRL,
+    usdToBrl:       USD_TO_BRL,
     stats: {
       total:   items.length,
       unique:  uniqueNames.length,
