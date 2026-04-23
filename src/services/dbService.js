@@ -1,8 +1,7 @@
-// dbService.js — Cache persistente Supabase (6h por padrão)
+// dbService.js — Cache persistente
 const { Pool } = require('pg');
 const logger   = require('../utils/logger');
 
-// STALE_HOURS padrão = 6h. O banco só será atualizado se o item tiver mais de 6h.
 const STALE_HOURS = Number(process.env.PRICE_STALE_HOURS || 6);
 
 const pool = new Pool({
@@ -28,7 +27,7 @@ async function setupDatabase() {
       );
       CREATE INDEX IF NOT EXISTS idx_item_prices_usd_name ON item_prices_usd (market_hash_name);
     `);
-    logger.success(`Banco pronto (Cache de preços: ${STALE_HOURS}h)`);
+    logger.success(`Banco pronto (Cache: ${STALE_HOURS}h)`);
   } finally {
     client.release();
   }
@@ -36,15 +35,13 @@ async function setupDatabase() {
 
 async function savePriceToDB(marketHashName, { buff, youpin }) {
   try {
-    // Só faz o UPSERT se o registro não existir ou se for mais antigo que STALE_HOURS
-    // Isso garante que não gastamos tokens se o item já estiver no banco e for recente.
     await pool.query(
       `INSERT INTO item_prices_usd (market_hash_name, buff, youpin, updated_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (market_hash_name) DO UPDATE SET
-         buff       = EXCLUDED.buff,
-         youpin     = EXCLUDED.youpin,
-         updated_at = NOW()
+         buff          = EXCLUDED.buff,
+         youpin        = EXCLUDED.youpin,
+         updated_at    = NOW()
        WHERE item_prices_usd.updated_at < NOW() - INTERVAL '${STALE_HOURS} hours'`,
       [marketHashName, buff || 0, youpin || 0]
     );
@@ -58,7 +55,6 @@ async function getBatchPricesFromDB(marketHashNames) {
   if (marketHashNames.length === 0) return result;
 
   try {
-    // Busca apenas itens que foram atualizados nas últimas STALE_HOURS
     const rows = await pool.query(
       `SELECT market_hash_name, buff, youpin
        FROM item_prices_usd
@@ -70,7 +66,7 @@ async function getBatchPricesFromDB(marketHashNames) {
     for (const row of rows.rows) {
       result.set(row.market_hash_name, {
         buff:   Number(row.buff),
-        youpin: Number(row.youpin),
+        youpin: Number(row.youpin)
       });
     }
   } catch (err) {

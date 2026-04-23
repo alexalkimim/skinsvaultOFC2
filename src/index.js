@@ -11,20 +11,23 @@ if (!API_KEY) { logger.error('CSINVENTORY_API_KEY não definida no .env'); proce
 
 function printResults({ results, totalBuffBRL, totalYouPinBRL, displayRate, stats }) {
   console.log('\n');
-  logger.banner('RESULTADO');
+  logger.banner('RESULTADO FINAL');
   console.log(`  💰  Total BUFF      →  R$ ${Number(totalBuffBRL).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`);
   console.log(`  💰  Total YouPin    →  R$ ${Number(totalYouPinBRL).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`);
   console.log(`  💱  Câmbio         →  ${displayRate}`);
-  console.log(`  📊  Cache          →  ${stats.fromDB} banco | ${stats.fromAPI} API | ${stats.unique} únicos\n`);
+  console.log(`  📊  Estatísticas   →  ${stats.total} itens | ${stats.unique} únicos | ${stats.fromDB} do banco`);
+  
   logger.divider();
   console.log('\n  📦  Itens (ordem: maior valor BUFF):\n');
+  
   for (const item of results) {
-    const qty  = item.quantity > 1 ? ` ×${item.quantity}` : '';
-    const name = item.name.length > 44 ? item.name.slice(0, 41) + '...' : item.name;
+    const qty  = item.quantity > 1 ? ` ×${item.quantity}` : '   ';
+    const name = item.name.length > 40 ? item.name.slice(0, 37) + '...' : item.name;
+    
     console.log(
-      `  • ${name.padEnd(48)}${qty.padEnd(4)}` +
-      `  BUFF: R$ ${String(item.buffBRL).padStart(8)} ($${item.buffUSD})` +
-      `  │  YouPin: R$ ${String(item.youpinBRL).padStart(8)} ($${item.youpinUSD})`
+      `  • ${name.padEnd(42)}${qty}` +
+      `  BUFF: R$ ${String(item.buffBRL).padStart(9)} ($${item.buffUSD.padStart(7)})` +
+      `  │  YouPin: R$ ${String(item.youpinBRL).padStart(9)} ($${item.youpinUSD.padStart(7)})`
     );
   }
   console.log('');
@@ -38,17 +41,18 @@ async function main() {
     process.exit(0);
   }
 
-  logger.banner('CS2 Inventory Pricer');
+  logger.banner('CS2 Inventory Pricer v2.2');
 
   try {
     await setupDatabase();
+    
     const steamId = await extractSteamID(input, API_KEY);
     logger.success(`SteamID64: ${steamId}`);
 
     logger.info('Buscando inventário...');
     const items = await fetchInventory(steamId, API_KEY);
+    
     logger.success(`${items.length} itens encontrados`);
-    if (items.length === 0) { logger.warn('Inventário vazio ou privado.'); return; }
 
     logger.info('Calculando preços...');
     const result = await processInventoryPrices(items, API_KEY);

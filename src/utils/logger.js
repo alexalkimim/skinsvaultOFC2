@@ -45,6 +45,12 @@ const logger = {
     console.log(`${timestamp()} ${COLORS.red}[ERROR]${COLORS.reset}    ${msg}`);
   },
 
+  debug(msg) {
+    if (process.env.DEBUG === 'true') {
+      console.log(`${timestamp()} ${COLORS.gray}[DEBUG]${COLORS.reset}    ${msg}`);
+    }
+  },
+
   divider() {
     console.log(`${COLORS.gray}${'─'.repeat(60)}${COLORS.reset}`);
   },
