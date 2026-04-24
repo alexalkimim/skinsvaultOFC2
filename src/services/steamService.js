@@ -1,4 +1,4 @@
-// steamService.js — FOCO TOTAL NO TRADE LINK (API V2)
+// steamService.js — LEITOR LIMPO E PRECISO
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
@@ -45,7 +45,6 @@ async function extractSteamID(input, apiKey) {
 }
 
 function parseInventoryResponse(data) {
-  // CORREÇÃO: Algumas rotas da v2 retornam o array direto, outras dentro de .data
   const rawItems = Array.isArray(data) ? data : (data.assets || data.inventory || data.data || []);
   
   const descMap = {};
@@ -56,11 +55,9 @@ function parseInventoryResponse(data) {
 
   const items = [];
   for (const asset of rawItems) {
-    // Se o item já vier com o nome (comum na v2), usamos direto
     let marketHashName = asset.market_hash_name;
     let displayName = asset.name || asset.market_hash_name;
 
-    // Se não tiver nome, tenta buscar nas descrições (comum na v1)
     if (!marketHashName) {
       const key = `${asset.classid}_${asset.instanceid || '0'}`;
       const desc = descMap[key] || (data.descriptions || []).find(d => String(d.classid) === String(asset.classid));
@@ -68,6 +65,7 @@ function parseInventoryResponse(data) {
       displayName = desc?.name || marketHashName;
     }
 
+    // Se o item não tiver nome válido, ignoramos sem inventar nomes falsos!
     if (!marketHashName) continue;
 
     const amount = parseInt(asset.amount, 10) || 1;
@@ -85,40 +83,27 @@ function parseInventoryResponse(data) {
 async function fetchInventory(steamId, apiKey) {
   const cacheKey = `inventory:${steamId}`;
   const cached   = cache.get(cacheKey);
-  if (cached) {
-      logger.cache(`Inventário carregado do cache local (${cached.length} itens).`);
-      return cached;
-  }
+  if (cached) return cached;
 
   const tradelink = tradeLinkMemory.get(steamId);
   let data;
 
-  // TENTATIVA 1: API v2 via Trade Link
   if (tradelink) {
     logger.request(`Buscando via Trade Link (API v2)...`);
     try {
       const res = await axios.get('https://csinventoryapi.com/api/v2/inventory', {
         timeout: 45000,
-        // Algumas versões usam 'url', outras 'tradelink'. Mandamos ambos.
         params: { api_key: apiKey, url: tradelink, tradelink: tradelink, appid: 730 },
       });
-      
       const resData = res.data;
-      // CORREÇÃO: Verificamos se há itens em .assets, .inventory ou .data (que vimos no seu log)
       const itemsFound = resData?.assets || resData?.inventory || resData?.data || (Array.isArray(resData) ? resData : []);
-      
       if (itemsFound && itemsFound.length > 0) {
         data = resData;
         logger.success(`✅ SUCESSO: ${itemsFound.length} itens via Trade Link (API v2)`);
-      } else {
-        logger.warn(`API v2 não retornou itens úteis. Tentando v1...`);
       }
-    } catch (err) {
-      logger.error(`Erro na API v2: ${err.response?.data?.message || err.message}. Tentando v1...`);
-    }
+    } catch (err) {}
   }
 
-  // TENTATIVA 2: API v1 (Fallback)
   if (!data) {
     logger.request(`Buscando via SteamID (API v1)...`);
     try {
@@ -126,28 +111,16 @@ async function fetchInventory(steamId, apiKey) {
         timeout: 25000,
         params: { api_key: apiKey, steamid64: steamId, appid: 730, contextid: 2, t: Date.now() },
       });
-      if (res.data?.assets?.length > 0 || res.data?.inventory?.length > 0) {
-        data = res.data;
-        logger.success(`Inventário capturado via API v1`);
-      }
-    } catch (err) {
-      logger.error(`Falha crítica na API v1: ${err.response?.data?.message || err.message}`);
-    }
+      if (res.data?.assets?.length > 0 || res.data?.inventory?.length > 0) data = res.data;
+    } catch (err) {}
   }
 
-  if (!data) {
-    throw new Error('ERRO: Não foi possível capturar os itens em nenhuma API.');
-  }
+  if (!data) throw new Error('ERRO: Não foi possível capturar os itens em nenhuma API.');
 
   const items = parseInventoryResponse(data);
-  
-  if (items.length === 0) {
-    throw new Error('ERRO: Inventário processado está vazio.');
-  }
+  if (items.length === 0) throw new Error('ERRO: Inventário processado está vazio.');
 
   logger.info(`Total de itens processados: ${items.length}`);
-  
-  // Cache curto (1 min) para garantir que você veja itens saindo do lock rápido
   cache.set(cacheKey, items, 1 * 60 * 1000);
   return items;
 }

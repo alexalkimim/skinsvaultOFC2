@@ -1,35 +1,24 @@
-// priceService.js — PRECISÃO DE MERCADO BRASILEIRO (SALDO BUFF)
 const axios  = require('axios');
 const logger = require('../utils/logger');
 const cache  = require('../utils/cache');
 const db     = require('./dbService');
-
-// Fator de descompressão da API (reverte o Dólar inflacionado para a raiz em Yuan)
-const BUFF_INTERNAL_USD_TO_CNY = 6.445; 
-
-// Cotação padrão do Saldo Buff no Brasil (Ajustável via .env)
-let BUFF_BALANCE_RATE = 0.7286; 
+const engine = require('./CurrencyEngine'); 
 
 async function fetchExchangeRate() {
-  if (process.env.BUFF_BALANCE_RATE) {
-    BUFF_BALANCE_RATE = Number(process.env.BUFF_BALANCE_RATE);
-    logger.success(`Câmbio (Saldo Buff .env): 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`);
-  } else {
-    logger.success(`Câmbio (Saldo Buff Calibrado): 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`);
+  try {
+    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL,CNY-BRL', { timeout: 8000 });
+    const usdBrl = Number(data.USDBRL.bid);
+    const cnyBrl = process.env.BUFF_BALANCE_RATE ? Number(process.env.BUFF_BALANCE_RATE) : Number(data.CNYBRL.bid);
+
+    engine.atualizarCambio(usdBrl, cnyBrl);
+    logger.success(`Motor Financeiro OK: 1 USD = R$ ${usdBrl.toFixed(2)} | 1 CNY (Saldo) = R$ ${cnyBrl.toFixed(4)}`);
+  } catch (err) {
+    logger.warn(`Falha na API de câmbio. Usando taxas internas.`);
   }
 }
 
-// A MÁGICA: Transforma o USD da API no BRL verdadeiro do mercado de skins
-function usdToRealBRL(fakeUsd) {
-  const trueCNY = Number(fakeUsd) * BUFF_INTERNAL_USD_TO_CNY;
-  return (trueCNY * BUFF_BALANCE_RATE).toFixed(2);
-}
-
 async function fetchAllPrices(source, apiKey) {
-  const cacheKey = `allprices_usd:${source}`;
-  const cached   = cache.get(cacheKey);
-  if (cached) { logger.cache(`Preços ${source} (cache)`); return cached; }
-
+  // Ignoramos o cache local para forçar o download dos preços frescos!
   logger.request(`Buscando TODOS os preços: ${source}`);
   const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
     timeout: 60000,
@@ -43,16 +32,13 @@ async function fetchAllPrices(source, apiKey) {
     if (name === 'success') continue;
 
     let priceUSD = 0;
-    if (info?.sell_price_cents?.usd) {
-      priceUSD = Number(info.sell_price_cents.usd) / 100;
-    } else if (info?.sell_price) {
-      priceUSD = Number(info.sell_price);
-    }
+    if (info?.sell_price_cents?.usd) priceUSD = Number(info.sell_price_cents.usd) / 100;
+    else if (info?.sell_price) priceUSD = Number(info.sell_price);
+    
     priceMap.set(name, priceUSD);
   }
 
   logger.success(`${source}: ${priceMap.size} preços carregados`);
-  cache.set(cacheKey, priceMap, 15 * 60 * 1000);
   return priceMap;
 }
 
@@ -110,8 +96,17 @@ async function processInventoryPrices(items, apiKey) {
     let buffUSD   = dbBatch.has(name) ? dbBatch.get(name).buff : (buffMap.get(name) || 0);
     let youpinUSD = dbBatch.has(name) ? dbBatch.get(name).youpin : (youpinMap.get(name) || 0);
 
-    if (buffUSD > 0 && (youpinUSD > buffUSD * 2 || youpinUSD === 0)) youpinUSD = buffUSD; 
-    else if (youpinUSD > 0 && (buffUSD > youpinUSD * 2 || buffUSD === 0)) buffUSD = youpinUSD;
+    // 🛡️ O EMPRÉSTIMO: Se a Buff der falha (0) num graffiti mas a Youpin tiver, copiamos!
+    if (buffUSD === 0 && youpinUSD > 0) buffUSD = youpinUSD;
+    if (youpinUSD === 0 && buffUSD > 0) youpinUSD = buffUSD;
+
+    // 🛡️ O ANTI-TROLL: Corta picos absurdos de manipulação (3x maior)
+    if (buffUSD > 0 && youpinUSD > buffUSD * 3) youpinUSD = buffUSD; 
+    else if (youpinUSD > 0 && buffUSD > youpinUSD * 3) buffUSD = youpinUSD;
+
+    if (buffUSD === 0 && youpinUSD === 0) {
+      logger.warn(`Sem preço (API V2): ${name}`);
+    }
 
     const buffTotalUSD   = buffUSD   * quantity;
     const youpinTotalUSD = youpinUSD * quantity;
@@ -122,8 +117,8 @@ async function processInventoryPrices(items, apiKey) {
     results.push({
       name:      item.name || name,
       quantity,
-      buffBRL:   usdToRealBRL(buffTotalUSD),
-      youpinBRL: usdToRealBRL(youpinTotalUSD),
+      buffBRL:   engine.converterPreco(buffTotalUSD, 'BUFF_USD_FAKE', 'buff').toFixed(2),
+      youpinBRL: engine.converterPreco(youpinTotalUSD, 'BUFF_USD_FAKE', 'youpin').toFixed(2),
       buffUSD:   buffTotalUSD.toFixed(2),
       youpinUSD: youpinTotalUSD.toFixed(2),
     });
@@ -131,11 +126,14 @@ async function processInventoryPrices(items, apiKey) {
 
   results.sort((a, b) => Number(b.buffBRL) - Number(a.buffBRL));
 
+  const totalFinalBuffBRL = engine.converterPreco(totalBuffUSD, 'BUFF_USD_FAKE', 'buff');
+  const totalFinalYoupinBRL = engine.converterPreco(totalYouPinUSD, 'BUFF_USD_FAKE', 'youpin');
+
   return {
     results,
-    totalBuffBRL:   usdToRealBRL(totalBuffUSD),
-    totalYouPinBRL: usdToRealBRL(totalYouPinUSD),
-    displayRate:    `Mercado Real (Saldo Buff) → 1 CNY = R$ ${BUFF_BALANCE_RATE.toFixed(4)}`,
+    totalBuffBRL:   totalFinalBuffBRL.toFixed(2),
+    totalYouPinBRL: totalFinalYoupinBRL.toFixed(2),
+    displayRate:    `Inteligência Cambial (Motor V1) Ativa`,
     stats: {
       total:   items.length,
       unique:  uniqueNames.length,
