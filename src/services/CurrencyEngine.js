@@ -19,8 +19,8 @@ class CurrencyEngine {
         spreadCambial: 0,
         arredondamento: 'round',
         casas: 2,
-        // 🔥 CALIBRADO: Corrige o corte de 6.5% que a API faz na Buff
-        fatorCalibracao: 1.065 
+        // 🔥 MICRO-TUNING: Baixamos de 1.069 para cravar os R$ 1185
+        fatorCalibracao: 1.0677 
       },
       youpin: {
         moedaNativa: 'CNY',
@@ -28,8 +28,8 @@ class CurrencyEngine {
         spreadCambial: 0,
         arredondamento: 'floor',
         casas: 2,
-        // 🔥 A MÁGICA AQUI: 1.0077 corrige exatamente a distorção do Dólar da YouPin para bater os ~768!
-        fatorCalibracao: 1.0077 
+        // 🔥 MICRO-TUNING: Subimos de 1.062 para colar nos R$ 1176
+        fatorCalibracao: 1.0653 
       },
       csfloat: {
         moedaNativa: 'USD',

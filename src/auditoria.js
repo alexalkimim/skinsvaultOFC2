@@ -62,11 +62,13 @@ async function runAuditoria() {
   console.log("==========================================================================================\n");
 
   for (const skin of SKINS_AUDITORIA) {
-    const bUsd = buffPrices.get(skin) || 0;
-    const yUsd = youpinPrices.get(skin) || 0;
-    const cUsd = csfloatPrices.get(skin) || 0;
+    // 💡 O TRUQUE DO VANILLA: Se a skin tiver " | Vanilla", ele apaga essa parte antes de procurar!
+    const nomeRealAPI = skin.replace(' | Vanilla', '');
 
-    // Passamos pelo motor! (Buff e Youpin usam o USD Falso da China, CSFloat usa USD puro)
+    const bUsd = buffPrices.get(nomeRealAPI) || 0;
+    const yUsd = youpinPrices.get(nomeRealAPI) || 0;
+    const cUsd = csfloatPrices.get(nomeRealAPI) || 0;
+
     const buffFinal    = bUsd > 0 ? engine.converterPreco(bUsd, 'BUFF_USD_FAKE', 'buff').toFixed(2) : "N/A";
     const youpinFinal  = yUsd > 0 ? engine.converterPreco(yUsd, 'BUFF_USD_FAKE', 'youpin').toFixed(2) : "N/A";
     const csfloatFinal = cUsd > 0 ? engine.converterPreco(cUsd, 'USD', 'csfloat').toFixed(2) : "N/A";
