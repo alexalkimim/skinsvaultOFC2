@@ -1,4 +1,3 @@
-// CurrencyEngine.js — COM CALIBRAÇÃO EXATA YOUPIN
 const logger = require('../utils/logger');
 
 class CurrencyEngine {
@@ -6,52 +5,22 @@ class CurrencyEngine {
     this.cambio = {
       USD_BRL: 5.00,
       CNY_BRL: 0.74,
-      CNY_USD: 0.148 
     };
-
-    // A taxa interna obscura da Buff (Descoberta na engenharia reversa)
-    this.BUFF_INTERNAL_CNY_TO_USD = 1 / 6.445; 
 
     this.perfis = {
       buff: {
-        moedaNativa: 'CNY',
-        taxaFixa: 0,
-        spreadCambial: 0,
-        arredondamento: 'round',
-        casas: 2,
-        // 🔥 MICRO-TUNING: Baixamos de 1.069 para cravar os R$ 1185
-        fatorCalibracao: 1.0677 
-      },
-      youpin: {
-        moedaNativa: 'CNY',
-        taxaFixa: 0,
-        spreadCambial: 0,
-        arredondamento: 'floor',
-        casas: 2,
-        // 🔥 MICRO-TUNING: Subimos de 1.062 para colar nos R$ 1176
-        fatorCalibracao: 1.0653 
-      },
-      csfloat: {
         moedaNativa: 'USD',
         taxaFixa: 0,
-        spreadCambial: 0.025, 
+        spreadCambial: 0,
         arredondamento: 'round',
         casas: 2,
         fatorCalibracao: 1.0
       },
-      skinport: {
-        moedaNativa: 'BRL', 
+      youpin: {
+        moedaNativa: 'USD',
         taxaFixa: 0,
-        spreadCambial: 0.04, 
-        arredondamento: 'ceil',
-        casas: 2,
-        fatorCalibracao: 1.0
-      },
-      steam: {
-        moedaNativa: 'BRL',
-        taxaFixa: 0.15, 
         spreadCambial: 0,
-        arredondamento: 'floor',
+        arredondamento: 'round',
         casas: 2,
         fatorCalibracao: 1.0
       }
@@ -61,7 +30,6 @@ class CurrencyEngine {
   atualizarCambio(usdBrl, cnyBrl) {
     this.cambio.USD_BRL = usdBrl;
     this.cambio.CNY_BRL = cnyBrl;
-    this.cambio.CNY_USD = cnyBrl / usdBrl;
   }
 
   aplicarArredondamento(valor, metodo, casas) {
@@ -79,15 +47,13 @@ class CurrencyEngine {
 
     let valorBaseBRL = 0;
 
-    if (moedaOrigem === 'CNY') {
-      valorBaseBRL = valor * this.cambio.CNY_BRL;
-    } else if (moedaOrigem === 'USD') {
+    // Agora convertemos diretamente com a cotação do segundo exato da AwesomeAPI
+    if (moedaOrigem === 'USD') {
       valorBaseBRL = valor * this.cambio.USD_BRL;
+    } else if (moedaOrigem === 'CNY') {
+      valorBaseBRL = valor * this.cambio.CNY_BRL;
     } else if (moedaOrigem === 'BRL') {
       valorBaseBRL = valor;
-    } else if (moedaOrigem === 'BUFF_USD_FAKE') {
-      const cnyReal = valor / this.BUFF_INTERNAL_CNY_TO_USD;
-      valorBaseBRL = cnyReal * this.cambio.CNY_BRL;
     }
 
     let valorComSpread = valorBaseBRL * (1 + perfil.spreadCambial);
@@ -95,22 +61,6 @@ class CurrencyEngine {
     let valorCalibrado = valorComTaxa * perfil.fatorCalibracao;
 
     return this.aplicarArredondamento(valorCalibrado, perfil.arredondamento, perfil.casas);
-  }
-
-  calibrarAutomaticamente(site, valorOrigem, moedaOrigem, valorRealNoSiteBRL) {
-    const perfil = this.perfis[site.toLowerCase()];
-    if (!perfil) return;
-
-    const fatorAntigo = perfil.fatorCalibracao;
-    perfil.fatorCalibracao = 1.0; 
-    
-    const valorCalculadoPuro = this.converterPreco(valorOrigem, moedaOrigem, site);
-    const fatorIdeal = valorRealNoSiteBRL / valorCalculadoPuro;
-
-    const alpha = 0.2; 
-    perfil.fatorCalibracao = (fatorAntigo * (1 - alpha)) + (fatorIdeal * alpha);
-
-    logger.info(`[Calibração] ${site.toUpperCase()} ajustado. Fator: ${perfil.fatorCalibracao.toFixed(4)}`);
   }
 }
 

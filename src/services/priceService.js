@@ -1,25 +1,20 @@
 const axios  = require('axios');
 const logger = require('../utils/logger');
-const cache  = require('../utils/cache');
-const db     = require('./dbService');
 const engine = require('./CurrencyEngine'); 
 
 async function fetchExchangeRate() {
   try {
-    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL,CNY-BRL', { timeout: 8000 });
+    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 8000 });
     const usdBrl = Number(data.USDBRL.bid);
-    const cnyBrl = process.env.BUFF_BALANCE_RATE ? Number(process.env.BUFF_BALANCE_RATE) : Number(data.CNYBRL.bid);
-
-    engine.atualizarCambio(usdBrl, cnyBrl);
-    logger.success(`Motor Financeiro OK: 1 USD = R$ ${usdBrl.toFixed(2)} | 1 CNY (Saldo) = R$ ${cnyBrl.toFixed(4)}`);
+    engine.atualizarCambio(usdBrl, 0); 
+    logger.success(`Câmbio Atualizado (Ao Vivo): 1 USD = R$ ${usdBrl.toFixed(3)}`);
   } catch (err) {
-    logger.warn(`Falha na API de câmbio. Usando taxas internas.`);
+    logger.warn(`Falha na API de câmbio. Usando taxas de fallback.`);
   }
 }
 
 async function fetchAllPrices(source, apiKey) {
-  // Ignoramos o cache local para forçar o download dos preços frescos!
-  logger.request(`Buscando TODOS os preços: ${source}`);
+  logger.request(`Baixando tabela de preços atualizada: ${source.toUpperCase()}`);
   const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
     timeout: 60000,
     params: { api_key: apiKey, source, app_id: 730 },
@@ -38,7 +33,7 @@ async function fetchAllPrices(source, apiKey) {
     priceMap.set(name, priceUSD);
   }
 
-  logger.success(`${source}: ${priceMap.size} preços carregados`);
+  logger.success(`${source.toUpperCase()}: ${priceMap.size} preços carregados com sucesso.`);
   return priceMap;
 }
 
@@ -59,32 +54,11 @@ async function processInventoryPrices(items, apiKey) {
   const grouped     = deduplicateItems(items);
   const uniqueNames = [...grouped.keys()];
 
-  const dbBatch = await db.getBatchPricesFromDB(uniqueNames);
-  const needsAPI = uniqueNames.filter(n => !dbBatch.has(n));
-
-  let buffMap   = new Map();
-  let youpinMap = new Map();
-
-  if (needsAPI.length > 0) {
-    logger.info(`API: Buscando preços para ${needsAPI.length} itens...`);
-    [buffMap, youpinMap] = await Promise.all([
-      fetchAllPrices('buff163', apiKey),
-      fetchAllPrices('youpin',  apiKey),
-    ]);
-
-    const toSave = [];
-    for (const name of needsAPI) {
-      const buff   = buffMap.get(name)   || 0;
-      const youpin = youpinMap.get(name) || 0;
-      if (buff > 0 || youpin > 0) toSave.push({ name, buff, youpin });
-    }
-
-    if (toSave.length > 0) {
-      await Promise.all(toSave.map(({ name, buff, youpin }) =>
-        db.savePriceToDB(name, { buff, youpin })
-      ));
-    }
-  }
+  logger.info(`Buscando cotações fresquinhas direto da API...`);
+  const [buffMap, youpinMap] = await Promise.all([
+    fetchAllPrices('buff163', apiKey),
+    fetchAllPrices('youpin',  apiKey),
+  ]);
 
   const results   = [];
   let totalBuffUSD   = 0;
@@ -93,19 +67,26 @@ async function processInventoryPrices(items, apiKey) {
   for (const name of uniqueNames) {
     const { item, quantity } = grouped.get(name);
 
-    let buffUSD   = dbBatch.has(name) ? dbBatch.get(name).buff : (buffMap.get(name) || 0);
-    let youpinUSD = dbBatch.has(name) ? dbBatch.get(name).youpin : (youpinMap.get(name) || 0);
+    let buffUSD   = buffMap.get(name) || 0;
+    let youpinUSD = youpinMap.get(name) || 0;
 
-    // 🛡️ O EMPRÉSTIMO: Se a Buff der falha (0) num graffiti mas a Youpin tiver, copiamos!
-    if (buffUSD === 0 && youpinUSD > 0) buffUSD = youpinUSD;
-    if (youpinUSD === 0 && buffUSD > 0) youpinUSD = buffUSD;
-
-    // 🛡️ O ANTI-TROLL: Corta picos absurdos de manipulação (3x maior)
-    if (buffUSD > 0 && youpinUSD > buffUSD * 3) youpinUSD = buffUSD; 
-    else if (youpinUSD > 0 && buffUSD > youpinUSD * 3) buffUSD = youpinUSD;
-
-    if (buffUSD === 0 && youpinUSD === 0) {
-      logger.warn(`Sem preço (API V2): ${name}`);
+    // 🛡️ O ANTI-TROLL DEFINITIVO (Espelhamento da Fonte da Verdade)
+    // A BUFF é a maior do mundo, logo, ela dita a regra.
+    if (buffUSD === 0) {
+        // Se a BUFF não tem o item (ou custa 0), qualquer preço na YouPin é troll. Zera os dois.
+        youpinUSD = 0;
+    } else if (youpinUSD === 0) {
+        // Se a YouPin não tiver o item para vender, copia o preço da BUFF para não afundar o gráfico.
+        youpinUSD = buffUSD;
+    } else {
+        // Corta inflação absurda: Se a YouPin estiver 40% mais cara que a BUFF, corta o preço pro valor da BUFF.
+        if (youpinUSD > buffUSD * 1.4) {
+            youpinUSD = buffUSD;
+        }
+        // E vice-versa
+        else if (buffUSD > youpinUSD * 1.4) {
+            buffUSD = youpinUSD;
+        }
     }
 
     const buffTotalUSD   = buffUSD   * quantity;
@@ -117,8 +98,8 @@ async function processInventoryPrices(items, apiKey) {
     results.push({
       name:      item.name || name,
       quantity,
-      buffBRL:   engine.converterPreco(buffTotalUSD, 'BUFF_USD_FAKE', 'buff').toFixed(2),
-      youpinBRL: engine.converterPreco(youpinTotalUSD, 'BUFF_USD_FAKE', 'youpin').toFixed(2),
+      buffBRL:   engine.converterPreco(buffTotalUSD, 'USD', 'buff').toFixed(2),
+      youpinBRL: engine.converterPreco(youpinTotalUSD, 'USD', 'youpin').toFixed(2),
       buffUSD:   buffTotalUSD.toFixed(2),
       youpinUSD: youpinTotalUSD.toFixed(2),
     });
@@ -126,19 +107,19 @@ async function processInventoryPrices(items, apiKey) {
 
   results.sort((a, b) => Number(b.buffBRL) - Number(a.buffBRL));
 
-  const totalFinalBuffBRL = engine.converterPreco(totalBuffUSD, 'BUFF_USD_FAKE', 'buff');
-  const totalFinalYoupinBRL = engine.converterPreco(totalYouPinUSD, 'BUFF_USD_FAKE', 'youpin');
+  const totalFinalBuffBRL = engine.converterPreco(totalBuffUSD, 'USD', 'buff');
+  const totalFinalYoupinBRL = engine.converterPreco(totalYouPinUSD, 'USD', 'youpin');
 
   return {
     results,
     totalBuffBRL:   totalFinalBuffBRL.toFixed(2),
     totalYouPinBRL: totalFinalYoupinBRL.toFixed(2),
-    displayRate:    `Inteligência Cambial (Motor V1) Ativa`,
+    displayRate:    `1:1 Cravado (Espelhamento BUFF + Anti-Troll)`,
     stats: {
       total:   items.length,
       unique:  uniqueNames.length,
-      fromDB:  dbBatch.size,
-      fromAPI: needsAPI.length,
+      fromDB:  0, 
+      fromAPI: uniqueNames.length,
     },
   };
 }
