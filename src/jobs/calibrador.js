@@ -1,40 +1,46 @@
 // src/jobs/calibrador.js
-const puppeteer = require('puppeteer');
+// Verifica a coerência da taxa de câmbio usando um item sentinela real.
+// Não usa scraping — apenas as APIs disponíveis.
+const axios  = require('axios');
 const engine = require('../services/CurrencyEngine');
 const logger = require('../utils/logger');
 
-async function calibrarCSFloat() {
-  logger.info('Iniciando Bot Calibrador no CSFloat...');
-  
-  // Abre um navegador invisível
-  const browser = await puppeteer.launch({ headless: "new" });
-  const page = await browser.newPage();
+// Item sentinela: volume alto no Buff, fácil de verificar manualmente
+const SENTINEL_ITEM = 'AK-47 | Redline (Field-Tested)';
 
+async function calibrarTaxa(apiKey) {
+  logger.info('Calibrador: verificando coerência da taxa de câmbio...');
   try {
-    // 1. Vamos até a página de uma skin sentinela bem comum (ex: AK-47 Slate FT)
-    await page.goto('https://csfloat.com/search?def_index=47&paint_index=1035&wear_tier=2', { waitUntil: 'networkidle2' });
+    const encoded = encodeURIComponent(SENTINEL_ITEM);
+    const { data } = await axios.get(
+      `https://csinventoryapi.com/api/v2/prices/${encoded}`,
+      {
+        params:  { api_key: apiKey, source: 'buff163' },
+        timeout: 10000,
+      }
+    );
 
-    // 2. Aqui o bot raspa a tela para ler o preço em BRL
-    // (O seletor exato depende do HTML do site, isso é um exemplo da lógica)
-    const priceBRLText = await page.$eval('.item-price-brl', el => el.innerText); 
-    const priceUSDText = await page.$eval('.item-price-usd', el => el.innerText);
-
-    // 3. Limpa os textos (tira o "R$" e o "$")
-    const valorBRL = Number(priceBRLText.replace(/[^0-9.-]+/g,""));
-    const valorUSD = Number(priceUSDText.replace(/[^0-9.-]+/g,""));
-
-    // 4. MANDA PARA A INTELIGÊNCIA DO NOSSO MOTOR!
-    if (valorBRL > 0 && valorUSD > 0) {
-      engine.calibrarAutomaticamente('csfloat', valorUSD, 'USD', valorBRL);
-      logger.success(`CSFloat Calibrado! A taxa oculta deles hoje é: ${(valorBRL / valorUSD).toFixed(2)}`);
+    const centavos = data?.sell_price_cents?.usd;
+    if (!centavos || centavos <= 0) {
+      logger.warn('Calibrador: sem preço para o item sentinela.');
+      return;
     }
 
-  } catch (error) {
-    logger.error(`Erro ao calibrar CSFloat: ${error.message}`);
-  } finally {
-    await browser.close(); // Fecha o navegador para não gastar memória
+    const precoUSD = centavos / 100;
+    const precoBRL = engine.usdParaBrl(precoUSD);
+    const taxa     = engine.getTaxa();
+
+    logger.info(
+      `Calibrador | ${SENTINEL_ITEM}:\n` +
+      `  USD:   $${precoUSD.toFixed(2)}\n` +
+      `  BRL:   R$ ${precoBRL.toFixed(2)}\n` +
+      `  Taxa:  1 USD = R$ ${taxa.usdBrl.toFixed(4)}\n` +
+      `  Spread: ${taxa.spread}%`
+    );
+    logger.success('Calibrador: taxa verificada. Compare com o Buff manualmente para ajustar BRL_SPREAD_PERCENT.');
+  } catch (err) {
+    logger.warn(`Calibrador: erro — ${err.message}`);
   }
 }
 
-// Exportamos a função para rodar a cada X horas no index.js
-module.exports = { calibrarCSFloat };
+module.exports = { calibrarTaxa };

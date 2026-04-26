@@ -1,39 +1,46 @@
+// src/services/priceService.js
 const axios  = require('axios');
 const logger = require('../utils/logger');
-const engine = require('./CurrencyEngine'); 
+const engine = require('./CurrencyEngine');
 
 async function fetchExchangeRate() {
   try {
-    const { data } = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 8000 });
-    const usdBrl = Number(data.USDBRL.bid);
-    engine.atualizarCambio(usdBrl, 0); 
-    logger.success(`Câmbio Atualizado (Ao Vivo): 1 USD = R$ ${usdBrl.toFixed(3)}`);
+    const { data } = await axios.get(
+      'https://economia.awesomeapi.com.br/last/USD-BRL,CNY-BRL',
+      { timeout: 8000 }
+    );
+    const usdBrl = Number(data.USDBRL?.bid || 0);
+    const cnyBrl = Number(data.CNYBRL?.bid || 0);
+    engine.atualizarCambio(usdBrl, cnyBrl);
   } catch (err) {
-    logger.warn(`Falha na API de câmbio. Usando taxas de fallback.`);
+    logger.warn(
+      `Falha na API de câmbio. Usando fallback: ` +
+      `1 USD = R$ ${engine.cambio.USD_BRL.toFixed(4)}`
+    );
   }
 }
 
 async function fetchAllPrices(source, apiKey) {
-  logger.request(`Baixando tabela de preços atualizada: ${source.toUpperCase()}`);
+  logger.request(`Baixando tabela de preços: ${source.toUpperCase()}`);
   const { data } = await axios.get('https://csinventoryapi.com/api/v2/prices', {
     timeout: 60000,
     params: { api_key: apiKey, source, app_id: 730 },
   });
 
-  const pricesObj = data.data || data.items || data;
+  const pricesObj = (data && typeof data === 'object' && !data.sell_price_cents)
+    ? (data.data || data.items || data)
+    : data;
+
   const priceMap = new Map();
-
   for (const [name, info] of Object.entries(pricesObj)) {
-    if (name === 'success') continue;
-
-    let priceUSD = 0;
-    if (info?.sell_price_cents?.usd) priceUSD = Number(info.sell_price_cents.usd) / 100;
-    else if (info?.sell_price) priceUSD = Number(info.sell_price);
-    
-    priceMap.set(name, priceUSD);
+    if (name === 'success' || typeof info !== 'object' || !info) continue;
+    const centavos = info?.sell_price_cents?.usd;
+    if (centavos && Number(centavos) > 0) {
+      priceMap.set(name, Number(centavos) / 100);
+    }
   }
 
-  logger.success(`${source.toUpperCase()}: ${priceMap.size} preços carregados com sucesso.`);
+  logger.success(`${source.toUpperCase()}: ${priceMap.size} preços carregados.`);
   return priceMap;
 }
 
@@ -42,8 +49,11 @@ function deduplicateItems(items) {
   for (const item of items) {
     const name = item.market_hash_name;
     if (!name) continue;
-    if (grouped.has(name)) grouped.get(name).quantity++;
-    else grouped.set(name, { item, quantity: 1 });
+    if (grouped.has(name)) {
+      grouped.get(name).quantity++;
+    } else {
+      grouped.set(name, { item, quantity: 1 });
+    }
   }
   return grouped;
 }
@@ -51,75 +61,69 @@ function deduplicateItems(items) {
 async function processInventoryPrices(items, apiKey) {
   await fetchExchangeRate();
 
-  const grouped     = deduplicateItems(items);
-  const uniqueNames = [...grouped.keys()];
+  const taxa    = engine.getTaxa();
+  const grouped = deduplicateItems(items);
+  const names   = [...grouped.keys()];
 
-  logger.info(`Buscando cotações fresquinhas direto da API...`);
+  logger.info(`Processando ${names.length} itens únicos...`);
+
   const [buffMap, youpinMap] = await Promise.all([
     fetchAllPrices('buff163', apiKey),
     fetchAllPrices('youpin',  apiKey),
   ]);
 
-  const results   = [];
+  const results      = [];
   let totalBuffUSD   = 0;
-  let totalYouPinUSD = 0;
+  let totalYoupinUSD = 0;
 
-  for (const name of uniqueNames) {
+  for (const name of names) {
     const { item, quantity } = grouped.get(name);
 
-    let buffUSD   = buffMap.get(name) || 0;
-    let youpinUSD = youpinMap.get(name) || 0;
+    const buffUSDUnit   = buffMap.get(name)   || 0;
+    const youpinUSDUnit = youpinMap.get(name) || 0;
 
-    // 🛡️ O ANTI-TROLL DEFINITIVO (Espelhamento da Fonte da Verdade)
-    // A BUFF é a maior do mundo, logo, ela dita a regra.
-    if (buffUSD === 0) {
-        // Se a BUFF não tem o item (ou custa 0), qualquer preço na YouPin é troll. Zera os dois.
-        youpinUSD = 0;
-    } else if (youpinUSD === 0) {
-        // Se a YouPin não tiver o item para vender, copia o preço da BUFF para não afundar o gráfico.
-        youpinUSD = buffUSD;
-    } else {
-        // Corta inflação absurda: Se a YouPin estiver 40% mais cara que a BUFF, corta o preço pro valor da BUFF.
-        if (youpinUSD > buffUSD * 1.4) {
-            youpinUSD = buffUSD;
-        }
-        // E vice-versa
-        else if (buffUSD > youpinUSD * 1.4) {
-            buffUSD = youpinUSD;
-        }
-    }
+    const buffTotalUSD   = buffUSDUnit   * quantity;
+    const youpinTotalUSD = youpinUSDUnit * quantity;
 
-    const buffTotalUSD   = buffUSD   * quantity;
-    const youpinTotalUSD = youpinUSD * quantity;
-    
     totalBuffUSD   += buffTotalUSD;
-    totalYouPinUSD += youpinTotalUSD;
+    totalYoupinUSD += youpinTotalUSD;
+
+    const buffTotalBRL   = engine.usdParaBrl(buffTotalUSD);
+    const youpinTotalBRL = engine.usdParaBrl(youpinTotalUSD);
 
     results.push({
-      name:      item.name || name,
+      name:          item.name || name,
+      marketName:    name,
       quantity,
-      buffBRL:   engine.converterPreco(buffTotalUSD, 'USD', 'buff').toFixed(2),
-      youpinBRL: engine.converterPreco(youpinTotalUSD, 'USD', 'youpin').toFixed(2),
-      buffUSD:   buffTotalUSD.toFixed(2),
-      youpinUSD: youpinTotalUSD.toFixed(2),
+      buffUSD:       buffTotalUSD.toFixed(2),
+      youpinUSD:     youpinTotalUSD.toFixed(2),
+      buffBRL:       buffTotalBRL.toFixed(2),
+      youpinBRL:     youpinTotalBRL.toFixed(2),
+      buffUSDUnit:   buffUSDUnit.toFixed(2),
+      youpinUSDUnit: youpinUSDUnit.toFixed(2),
+      buffBRLUnit:   engine.usdParaBrl(buffUSDUnit).toFixed(2),
+      youpinBRLUnit: engine.usdParaBrl(youpinUSDUnit).toFixed(2),
     });
   }
 
   results.sort((a, b) => Number(b.buffBRL) - Number(a.buffBRL));
 
-  const totalFinalBuffBRL = engine.converterPreco(totalBuffUSD, 'USD', 'buff');
-  const totalFinalYoupinBRL = engine.converterPreco(totalYouPinUSD, 'USD', 'youpin');
+  const totalBuffBRL   = engine.usdParaBrl(totalBuffUSD);
+  const totalYoupinBRL = engine.usdParaBrl(totalYoupinUSD);
 
   return {
     results,
-    totalBuffBRL:   totalFinalBuffBRL.toFixed(2),
-    totalYouPinBRL: totalFinalYoupinBRL.toFixed(2),
-    displayRate:    `1:1 Cravado (Espelhamento BUFF + Anti-Troll)`,
+    totalBuffBRL:   totalBuffBRL.toFixed(2),
+    totalYouPinBRL: totalYoupinBRL.toFixed(2),
+    displayRate:
+      `1 USD = R$ ${taxa.usdBrl.toFixed(4)} | ` +
+      `1 CNY = R$ ${taxa.cnyBrl.toFixed(4)} | ` +
+      `Spread: ${taxa.spread}%`,
     stats: {
       total:   items.length,
-      unique:  uniqueNames.length,
-      fromDB:  0, 
-      fromAPI: uniqueNames.length,
+      unique:  names.length,
+      fromDB:  0,
+      fromAPI: names.length,
     },
   };
 }
