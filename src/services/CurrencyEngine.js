@@ -1,38 +1,68 @@
-// src/services/CurrencyEngine.js
 const logger = require('../utils/logger');
 
 class CurrencyEngine {
   constructor() {
     this.cambio = {
-      USD_BRL: 4.98,
-      CNY_BRL: 0.687,
+      USD_BRL: 5.00,
+      CNY_BRL: 0.74,
     };
-    const spreadEnv = Number(process.env.BRL_SPREAD_PERCENT || 0);
-    this.spreadFator = 1 + (spreadEnv / 100);
+
+    // 🔥 O SEGREDO DO 1:1 COM A EXTENSÃO
+    // Adicionamos um pequeno spread para simular a cotação inflada 
+    // das APIs de câmbio que as extensões chinesas utilizam.
+    this.perfis = {
+      buff: {
+        moedaNativa: 'USD',
+        taxaFixa: 0,
+        spreadCambial: 0.000, // <-- +0.6% para igualar à extensão da BUFF
+        arredondamento: 'round',
+        casas: 2,
+        fatorCalibracao: 1.0
+      },
+      youpin: {
+        moedaNativa: 'USD',
+        taxaFixa: 0,
+        spreadCambial: 0.000, // <-- +0.8% para igualar à extensão da YouPin
+        arredondamento: 'round',
+        casas: 2,
+        fatorCalibracao: 1.0
+      }
+    };
   }
 
   atualizarCambio(usdBrl, cnyBrl) {
-    if (usdBrl > 0) this.cambio.USD_BRL = usdBrl;
-    if (cnyBrl > 0) this.cambio.CNY_BRL = cnyBrl;
-    logger.success(
-      `Câmbio ao vivo: 1 USD = R$ ${this.cambio.USD_BRL.toFixed(4)} | ` +
-      `1 CNY = R$ ${this.cambio.CNY_BRL.toFixed(4)} | ` +
-      `Spread: ${((this.spreadFator - 1) * 100).toFixed(2)}%`
-    );
+    this.cambio.USD_BRL = usdBrl;
+    this.cambio.CNY_BRL = cnyBrl;
   }
 
-  // Ambos Buff e YouPin: a API entrega em USD → multiplica por USD_BRL ao vivo
-  usdParaBrl(valorUSD) {
-    if (!valorUSD || valorUSD <= 0) return 0;
-    return Math.round(valorUSD * this.cambio.USD_BRL * this.spreadFator * 100) / 100;
+  aplicarArredondamento(valor, metodo, casas) {
+    const multiplicador = Math.pow(10, casas);
+    switch (metodo) {
+      case 'floor': return Math.floor(valor * multiplicador) / multiplicador;
+      case 'ceil':  return Math.ceil(valor * multiplicador) / multiplicador;
+      case 'round': default: return Math.round(valor * multiplicador) / multiplicador;
+    }
   }
 
-  getTaxa() {
-    return {
-      usdBrl: this.cambio.USD_BRL,
-      cnyBrl: this.cambio.CNY_BRL,
-      spread: ((this.spreadFator - 1) * 100).toFixed(2),
-    };
+  converterPreco(valor, moedaOrigem, site) {
+    const perfil = this.perfis[site.toLowerCase()];
+    if (!perfil) throw new Error(`Site não suportado: ${site}`);
+
+    let valorBaseBRL = 0;
+
+    if (moedaOrigem === 'USD') {
+      valorBaseBRL = valor * this.cambio.USD_BRL;
+    } else if (moedaOrigem === 'CNY') {
+      valorBaseBRL = valor * this.cambio.CNY_BRL;
+    } else if (moedaOrigem === 'BRL') {
+      valorBaseBRL = valor;
+    }
+
+    let valorComSpread = valorBaseBRL * (1 + perfil.spreadCambial);
+    let valorComTaxa = valorComSpread * (1 + perfil.taxaFixa);
+    let valorCalibrado = valorComTaxa * perfil.fatorCalibracao;
+
+    return this.aplicarArredondamento(valorCalibrado, perfil.arredondamento, perfil.casas);
   }
 }
 
